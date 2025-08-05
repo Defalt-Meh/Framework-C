@@ -46,7 +46,7 @@ compile_args = [
 
 link_args = []
 
-system  = platform.system()
+system  = platform.system().lower()
 machine = platform.machine().lower()
 
 if system == "darwin" and machine == "arm64":       # Apple silicon macOS

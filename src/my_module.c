@@ -17,14 +17,17 @@
 /*------------------------------------------------------------------*/
 static void capsule_destruct(PyObject *capsule)
 {
-    /* NULL on second entry ⇒ nothing happens. */
-    NeuralNetwork_Type *p = PyCapsule_GetPointer(capsule, "frameworkc.nn");
-    if (!p) return;
+    // only proceed if this capsule still holds our NN pointer
+    if (!PyCapsule_IsValid(capsule, "frameworkc.nn"))
+        return;
 
-    NNdestroy(p);    /* frees w, b, h, o and zeroes the struct */
-    free(p);         /* <- free the struct itself */
+    // grab and free the C struct
+    NeuralNetwork_Type *p =
+        PyCapsule_GetPointer(capsule, "frameworkc.nn");
+    NNdestroy(p);
+    free(p);
 
-    /* mark the capsule as empty so another call is safe */
+    // clear the pointer so future calls do nothing
     PyCapsule_SetPointer(capsule, NULL);
 }
 
@@ -125,6 +128,7 @@ static PyObject *py_predict(PyObject *self, PyObject *args) {
 /* forward-decl so the table knows this symbol exists */
 static PyObject *py_predict_batch_fast(PyObject *self, PyObject *args);
 static PyObject *py_train_one(PyObject*, PyObject*);      /* NEW */
+static PyObject *py_train_batch(PyObject *self, PyObject *args);
 /* ------------------------------------------------------------------ */
 /*  Method table & module init                                         */
 /* ------------------------------------------------------------------ */
@@ -137,6 +141,8 @@ static PyMethodDef Methods[] = {
      "predict_batch(net, float32 array[B,nips]) -> float32 array[B,nops]"},
     {"train_one",      py_train_one,         METH_VARARGS,
     "train_one(net, x, t, lr) -> loss"},
+    {"train_batch", py_train_batch, METH_VARARGS,
+     "train_batch(net, X[B,nips], Y[B,nops], lr) -> None"},
     {NULL, NULL, 0, NULL}
 };
 
@@ -248,4 +254,53 @@ cleanup:
     Py_DECREF(x_fast); Py_DECREF(t_fast);
     if (PyErr_Occurred()) return NULL;
     return PyFloat_FromDouble(loss);
+}
+
+/* src/my_module.c  —  optimized py_train_batch */
+static PyObject *
+py_train_batch(PyObject *self, PyObject *args)
+{
+    PyObject      *capsule;
+    PyArrayObject *x_arr, *t_arr;
+    double         lr_double;
+
+    if (!PyArg_ParseTuple(args, "OO!O!d",
+                          &capsule,
+                          &PyArray_Type, &x_arr,
+                          &PyArray_Type, &t_arr,
+                          &lr_double))
+        return NULL;
+
+    NeuralNetwork_Type *net =
+        PyCapsule_GetPointer(capsule, "frameworkc.nn");
+    if (!net) return NULL;
+
+    if (PyArray_TYPE(x_arr) != NPY_FLOAT32 || PyArray_NDIM(x_arr) != 2 ||
+        !PyArray_IS_C_CONTIGUOUS(x_arr) ||
+        PyArray_TYPE(t_arr) != NPY_FLOAT32 || PyArray_NDIM(t_arr) != 2 ||
+        !PyArray_IS_C_CONTIGUOUS(t_arr))
+    {
+        PyErr_SetString(PyExc_TypeError,
+           "train_batch requires C-contiguous float32 2-D arrays");
+        return NULL;
+    }
+
+    const int B    = (int)PyArray_DIM(x_arr, 0);
+    const int nips = (int)PyArray_DIM(x_arr, 1);
+    const int nops = (int)PyArray_DIM(t_arr, 1);
+    if (nips != net->nips || nops != net->nops) {
+        PyErr_Format(PyExc_ValueError,
+                     "expected shapes [*,%d] and [*,%d]",
+                     net->nips, net->nops);
+        return NULL;
+    }
+
+    float *restrict X = (float*)PyArray_DATA(x_arr);
+    float *restrict Y = (float*)PyArray_DATA(t_arr);
+    float lr = (float)lr_double;
+
+    // Single‐call batch trainer — does one big forward/backward/update
+    NNtrain_batch(net, B, X, Y, lr);
+
+    Py_RETURN_NONE;
 }

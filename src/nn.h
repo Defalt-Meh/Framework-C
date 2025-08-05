@@ -37,5 +37,11 @@ void NNpredict_batch(const NeuralNetwork_Type nn,const float *batch_in,int B,flo
                                                                                                         batch_in  : row-major  B × nips   (float32)
                                                                                                         batch_out : row-major  B × nops   (float32) – caller allocates
                                                                                                 */
+void NNtrain_batch(NeuralNetwork_Type *nn,
+                   int B,
+                   const float *X,    // B×nips
+                   const float *Y,    // B×nops
+                   float lr);
+
 
 #endif /* NN_H */
