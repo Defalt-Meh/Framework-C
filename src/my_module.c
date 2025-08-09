@@ -21,15 +21,16 @@ static void capsule_destruct(PyObject *capsule)
     if (!PyCapsule_IsValid(capsule, "frameworkc.nn"))
         return;
 
-    // grab and free the C struct
-    NeuralNetwork_Type *p =
-        PyCapsule_GetPointer(capsule, "frameworkc.nn");
-    NNdestroy(p);
-    free(p);
+    NeuralNetwork_Type *p = PyCapsule_GetPointer(capsule, "frameworkc.nn");
 
-    // clear the pointer so future calls do nothing
-    PyCapsule_SetPointer(capsule, NULL);
+    if (!p)
+        return;  // already cleared or double-finalized
+
+    NNdestroy(p);   // assumes NNdestroy frees internal buffers only
+    free(p);        // free the struct itself
+
 }
+
 
 
 

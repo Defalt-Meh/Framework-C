@@ -108,15 +108,21 @@ deactivate                       # Exit virtualenv
 
 ```
 framework-c/
-├── elas/                  # Portable BLAS fallback (ELAS)
-│   ├── elas.h
-│   └── elas.c
+│                
 ├── src/                   # Core C implementation
-│   ├── nn.h
-│   └── nn.c
-├── python/                # Python wrapper & benchmarks
-│   ├── frameworkc.c       # C API bridge
-│   └── benchmark.py
+│   ├── data_split.h
+│   ├── data_split.c
+│   ├── elas.c             # Portable BLAS fallback (ELAS)
+│   ├── elas.c
+│   ├── model_selection.c
+│   ├── model_selection.c
+│   ├── my_module.c
+│   ├── nn.c
+│   ├── nn.c
+│   ├── utils.c
+│   └── utils.c
+├── benchmark_mnist.py      
+├── benchmark_semeion.py 
 ├── setup.py               # Build script (setuptools Extension)
 ├── README.md              # Project documentation
 └── LICENSE                # MIT License

@@ -21,7 +21,6 @@
 /* ───────────────────────────────────────────────────────────────── */
 
 /* ─────────── Static forward declarations (unchanged) ──────────── */
-static float err   (float a, const float b);
 static float toterr(const float *tg, const float *o, int size);
 static float pderr (float a, const float b);
 static float frand (void);
@@ -35,300 +34,282 @@ static inline float frand(void)
     return rand() * inv_rand_max;
 }
 
-/* Scalar fast-sigmoid used for tiny vectors
- *     σ_fast(x) = 0.5 * (x / (1 + |x|)) + 0.5
- */
+/* ───────────────────────────────────────────────────────────────── */
+/* ────────────────────── OPTIMIZED HELPERS ──────────────────────---*/
+/* ───────────────────────────────────────────────────────────────── */
+/* Forward: σ_fast(x) = 0.5 * (x / (1 + |x|)) + 0.5
+   - Uses one fabsf
+   - Uses fmaf to keep precision and ILP
+*/
 static inline float fast_sigmoid(float x)
 {
-    const float inv = 1.0f / (1.0f + fabsf(x));
-    return 0.5f * (x * inv) + 0.5f;
+    const float a   = fabsf(x);
+    const float den = 1.0f + a;
+    const float inv = 1.0f / den;                  // ok with -ffast-math
+    return fmaf(x, 0.5f * inv, 0.5f);              // 0.5*(x*inv) + 0.5
+}
+
+/* Backward: σ_fast'(x) = 0.5 * (1 + |x|)^(-2)
+   Use when you have dL/dσ and need dL/dx = dL/dσ * σ'(x)
+*/
+static inline float fast_sigmoid_grad(float x)
+{
+    const float a   = fabsf(x);
+    const float den = 1.0f + a;
+    const float inv = 1.0f / den;
+    return 0.5f * inv * inv;                        // 0.5 / (1+|x|)^2
 }
 
 
-/*
- * Book of FRAMEWORK-C, Drop-in Optimized Replacement  
- *
- * EXACT same logic as original, but with minimal performance improvements:
- * - Reduced memory loads by caching repeated values
- * - Better compiler optimization hints
- * - Improved loop structures for better CPU pipelining
- * 
- * ZERO functional changes - only performance optimizations
- */
 
+
+
+/* ───────────────────────────────────────────────────────────────── */
+
+/* Portable, fused, softmax-capable forward pass (fixed & polished) */
 static void fprop(const NeuralNetwork_Type nn, const float * const in)
 {
     const int nips = nn.nips;
     const int nhid = nn.nhid;
     const int nops = nn.nops;
 
-    const float *w = nn.w;    /* input→hidden weights (nhid×nips) */
-    const float *x = nn.x;    /* hidden→output weights (nops×nhid) */
-    const float *b = nn.b;    /* b[0]=hidden bias, b[1]=output bias */
-    float       *h = nn.h;    /* hidden activations */
-    float       *o = nn.o;    /* output activations */
+    const float *w = nn.w;  /* input→hidden  (nhid × nips), row-major */
+    const float *x = nn.x;  /* hidden→output (nops × nhid), row-major */
+    const float *b = nn.b;  /* b[0]=hidden bias, b[1]=output bias (scalar) */
+    float       *h = nn.h;  /* hidden activations */
+    float       *o = nn.o;  /* output activations */
 
-    /* ── Hidden layer GEMM ─────────────────────────────────────────── */
-    /* Technical: compute h = in·wᵀ */
+    /* -------- Hidden: h = in · w^T -------- */
+#if defined(FWC_USE_BLAS) && (FWC_USE_BLAS+0)==1
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 1, nhid, nips,
-                1.0f,
-                in, nips,
-                w,  nips,
-                0.0f,
-                h,  nhid);
+                1.0f, in, nips,
+                      w,  nips,
+                0.0f, h,  nhid);
+#else
+    for (int j = 0; j < nhid; ++j) {
+        const float *wj = w + (size_t)j * nips;
+        float acc = 0.0f;
+        for (int k = 0; k < nips; ++k) acc += in[k] * wj[k];
+        h[j] = acc;
+    }
+#endif
 
-    /* ── Bias + activation on hidden layer ────────────────────────── */
-    /* "Let there be nonlinearity," said the Architect, and it was so. */
-    if (nhid <= 128) {  /* Scalar fast-sigmoid path for small nhid */
-        const float bias_h = b[0];  // Cache bias to avoid repeated memory access
-        for (int i = 0; i < nhid; ++i) {
-            /* z = weighted sum + bias */
-            const float z = h[i] + bias_h;
-            /* σ(z) ≈ z/(1+|z|) */
-            h[i] = fast_sigmoid(z);
-        }
-    } else {            /* SIMD logistic via tanh for large nhid */
-        /* Add bias to all lanes: h[:] += b[0] */
-        vDSP_vsadd(h, 1, &b[0], h, 1, nhid);
-
-        /* Compute logistic using tanh identity:
-         *   σ(z) = 0.5 * tanh(0.5*z) + 0.5
-         */
-        static const float half = 0.5f;
-        /* Scale: 0.5 * (z) */
-        vDSP_vsmul(h, 1, &half, h, 1, nhid);
-
-        /* "And the seraphim sang," invoking the hyperbolic host */
-        int cnt = nhid;
-        vvtanhf(h, h, &cnt);              /* tanh(0.5*z) */
-
-        /* Finish logistic: 0.5*tanh + 0.5 */
-        vDSP_vsmsa(h, 1, &half, &half, h, 1, nhid);
+    /* Fuse bias + activation for hidden */
+    const float bh = b[0];
+    for (int j = 0; j < nhid; ++j) {
+        const float z = h[j] + bh;
+#if defined(FWC_CACHE_Z)
+        nn.hz[j] = z;            /* <-- needed for fast_sigmoid_grad in bprop */
+#endif
+        h[j] = fast_sigmoid(z);
+        /* For ReLU speed, swap to: h[j] = z > 0.f ? z : 0.f; */
     }
 
-    /* ── Output layer GEMM ─────────────────────────────────────────── */
-    /* Technical: compute o = h·xᵀ */
+    /* -------- Output: o = h · x^T -------- */
+#if defined(FWC_USE_BLAS) && (FWC_USE_BLAS+0)==1
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 1, nops, nhid,
-                1.0f,
-                h, nhid,
-                x, nhid,
-                0.0f,
-                o, nops);
+                1.0f, h,  nhid,
+                      x,  nhid,
+                0.0f, o,  nops);
+#else
+    for (int i = 0; i < nops; ++i) {
+        const float *xi = x + (size_t)i * nhid;
+        float acc = 0.0f;
+        for (int j = 0; j < nhid; ++j) acc += h[j] * xi[j];
+        o[i] = acc;
+    }
+#endif
 
-    /* ── Bias + activation on output layer ────────────────────────── */
-    /* "My creation shall judge the multitudes," spoke the Maker. */
-    if (nops < 128) {  /* Scalar path for outputs */
-        const float bias_o = b[1];  // Cache bias to avoid repeated memory access
+    /* -------- Output epilogue -------- */
+    if (nops > 1) {  /* stable softmax */
+        const float bo = b[1];
+        float m = -FLT_MAX;
+        for (int i = 0; i < nops; ++i) { o[i] += bo; if (o[i] > m) m = o[i]; }
+        float s = 0.0f;
+        for (int i = 0; i < nops; ++i) { o[i] = expf(o[i] - m); s += o[i]; }
+        const float invs = s > 0.0f ? (1.0f / s) : 1.0f;
+        for (int i = 0; i < nops; ++i) o[i] *= invs;
+        return;
+    }
+
+    /* binary / regression-like path: sigmoid */
+    {
+        const float bo = b[1];
         for (int i = 0; i < nops; ++i) {
-            const float z = o[i] + bias_o;
+            const float z = o[i] + bo;
             o[i] = fast_sigmoid(z);
         }
-    } else {           /* SIMD logistic via tanh for large output */
-        vDSP_vsadd(o, 1, &b[1], o, 1, nops);
-        static const float half = 0.5f;
-        vDSP_vsmul(o, 1, &half, o, 1, nops);
-        int cnt_o = nops;
-        vvtanhf(o, o, &cnt_o);
-        vDSP_vsmsa(o, 1, &half, &half, o, 1, nops);
     }
 }
 
-/*
- * Book of FRAMEWORK-C, Chapter 2 (Drop-in Optimized)
- *
- * EXACT same mathematical operations as original, with micro-optimizations:
- * - Unrolled summation loops for better CPU utilization  
- * - Cached repeated calculations
- * - Better memory access patterns
- */
+
 static void bprop(const NeuralNetwork_Type nn,
                   const float *in,
                   const float *tg,
                   float rate)
 {
     const int nips = nn.nips, nhid = nn.nhid, nops = nn.nops;
-    float *W = nn.w, *X = nn.x, *b = nn.b;
-    float *h = nn.h, *o = nn.o;
 
-    /* ---- 1. δ_out = (o − tg) ⊙ σ'(o) ------------------------------- */
+    float *restrict W = nn.w;
+    float *restrict X = nn.x;
+    float *restrict b = nn.b;
+    float *restrict h = nn.h;
+    float *restrict o = nn.o;
+
+#if defined(FWC_CACHE_Z)
+    const float *restrict hz = nn.hz;
+    /* const float *restrict oz = nn.oz; */
+#endif
+
+    /* Portable allocation for delta buffers (avoid VLAs on MSVC) */
+#if defined(_MSC_VER) || defined(FWC_NO_VLA)
+    float *delta_o = (float*)malloc((size_t)nops * sizeof(float));
+    float *delta_h = (float*)malloc((size_t)nhid * sizeof(float));
+    if (!delta_o || !delta_h) { free(delta_o); free(delta_h); return; }
+#else
     float delta_o[nops];
-    if (nops <= 128) {
-        for (int j = 0; j < nops; ++j) {
-            const float oj = o[j];  // Cache o[j] to avoid repeated access
-            const float err = oj - tg[j];
-            delta_o[j] = err * oj * (1.0f - oj);
-        }
-    } else {
-        for (int j = 0; j < nops; ++j) {
-            const float oj = o[j];  // Cache o[j]
-            const float err = oj - tg[j];
-            const float t = 2.0f * oj - 1.0f;
-            delta_o[j] = err * 0.5f * (1.0f - t*t);
-        }
-    }
-
-    /* ---- 2. δ_hid = (Xᵀ·δ_out) ⊙ σ'(h) ------------------------------ */
     float delta_h[nhid];
-    cblas_sgemv(CblasRowMajor, CblasTrans,
-                nops, nhid,
-                1.0f,
-                X,  nhid,
-                delta_o, 1,
-                0.0f,
-                delta_h, 1);
+#endif
 
-    if (nhid <= 128) {
-        for (int i = 0; i < nhid; ++i) {
-            const float hi = h[i];  // Cache h[i] to avoid repeated access
-            delta_h[i] *= hi * (1.0f - hi);
-        }
+    /* 1) Output deltas */
+    if (nops > 1) {
+        for (int j = 0; j < nops; ++j)
+            delta_o[j] = o[j] - tg[j];                  /* softmax + CE */
     } else {
-        for (int i = 0; i < nhid; ++i) {
-            const float hi = h[i];  // Cache h[i]
-            const float t = 2.0f * hi - 1.0f;
-            delta_h[i] *= 0.5f * (1.0f - t*t);
+        for (int j = 0; j < nops; ++j) {
+            const float oj  = o[j];
+            const float err = oj - tg[j];
+#if defined(FWC_CACHE_Z)
+            /* If you cache oz and use fast_sigmoid at output, prefer:
+               delta_o[j] = err * fast_sigmoid_grad(oz[j]); */
+            delta_o[j] = err * oj * (1.0f - oj);
+#else
+            delta_o[j] = err * oj * (1.0f - oj);
+#endif
         }
     }
 
-    /* ---- 3a) X ← X − η·δ_out·hᵀ (GER) ------------------------------ */
+    /* 2) Hidden deltas: delta_h = X^T * delta_o */
+    cblas_sgemv(CblasRowMajor, CblasTrans,
+                nops, nhid, 1.0f,
+                X, nhid, delta_o, 1,
+                0.0f, delta_h, 1);
+
+    /* Multiply by activation derivative at hidden */
+#if defined(FWC_RELU_HID)
+    for (int i = 0; i < nhid; ++i) {
+    #if defined(FWC_CACHE_Z)
+        delta_h[i] *= (hz[i] > 0.0f) ? 1.0f : 0.0f;
+    #else
+        delta_h[i] *= (h[i] > 0.0f) ? 1.0f : 0.0f;
+    #endif
+    }
+#else
+    for (int i = 0; i < nhid; ++i) {
+    #if defined(FWC_CACHE_Z)
+        /* exact grad of fast_sigmoid using cached z */
+        delta_h[i] *= fast_sigmoid_grad(hz[i]);
+    #else
+        /* fallback: classic logistic derivative using h */
+        const float hi = h[i];
+        delta_h[i] *= hi * (1.0f - hi);
+    #endif
+    }
+#endif
+
+    /* 3) Parameter updates */
     const float nrate = -rate;
+
+    /* X ← X + nrate * (delta_o · h^T) */
     cblas_sger(CblasRowMajor, nops, nhid, nrate,
                delta_o, 1, h, 1, X, nhid);
 
-    /* ---- 3b) W ← W − η·δ_hid·inᵀ (GER) ----------------------------- */
+    /* W ← W + nrate * (delta_h · in^T) */
     cblas_sger(CblasRowMajor, nhid, nips, nrate,
                delta_h, 1, in, 1, W, nips);
 
-    /* ---- 3c) Bias updates (optimized summation) ------------------- */
-    {
-        float sum_do = 0.0f, sum_dh = 0.0f;
-        
-        // Unrolled summation for delta_o - better CPU pipelining
-        int j = 0;
-        for (; j <= nops - 4; j += 4) {
-            sum_do += delta_o[j] + delta_o[j+1] + delta_o[j+2] + delta_o[j+3];
-        }
-        // Handle remaining elements
-        for (; j < nops; ++j) {
-            sum_do += delta_o[j];
-        }
-        
-        // Unrolled summation for delta_h  
-        int i = 0;
-        for (; i <= nhid - 4; i += 4) {
-            sum_dh += delta_h[i] + delta_h[i+1] + delta_h[i+2] + delta_h[i+3];
-        }
-        // Handle remaining elements
-        for (; i < nhid; ++i) {
-            sum_dh += delta_h[i];
-        }
+    /* Biases (scalar per layer) */
+    float sum_do = 0.0f, sum_dh = 0.0f;
+    int j = 0;
+    for (; j <= nops - 4; j += 4)
+        sum_do += delta_o[j] + delta_o[j+1] + delta_o[j+2] + delta_o[j+3];
+    for (; j < nops; ++j) sum_do += delta_o[j];
 
-        /* b[1] = b[1] + (–rate)*sum_do ;  b[0] = b[0] + (–rate)*sum_dh */
-        b[1] += nrate * sum_do;
-        b[0] += nrate * sum_dh;
-    }
-}
+    int i = 0;
+    for (; i <= nhid - 4; i += 4)
+        sum_dh += delta_h[i] + delta_h[i+1] + delta_h[i+2] + delta_h[i+3];
+    for (; i < nhid; ++i) sum_dh += delta_h[i];
 
+    b[1] += nrate * sum_do;
+    b[0] += nrate * sum_dh;
 
-
-
-/*
- * And it came to pass at the dawn of creation:
- * the weights and biases were clothed in randomness,
- * that the network might awaken with life anew.
- */
-static inline void wbrand(const NeuralNetwork_Type nn) {
-    /* Gather the counts and pointers, that thy loops run swift and true */
-    const int nw = nn.nw;
-    const int nb = nn.nb;
-    float *w_ptr = nn.w;
-    float *b_ptr = nn.b;
-
-    /* — Anoint the weights with random favor — */
-    for (int i = 0; i < nw; ++i) {
-        *w_ptr++ = frand() - 0.5f;
-    }
-
-    /* — Bestow upon the biases the breath of chance — */
-    for (int i = 0; i < nb; ++i) {
-        *b_ptr++ = frand() - 0.5f;
-    }
-}
-
-
-/*
- * And it came to pass, the Lord spoke unto the scribe:
- * “Let there be error, that the cost may be accounted,”
- * and thus was ordained this sacred function.
- */
-static inline float err(const float a, const float b) {
-    /* “Take thou the difference of thy prediction and thy target,
-     * for therein lies the seed of correction.” */
-    const float diff = a - b;
-    /* “And offer half its square upon the altar of loss,
-     * that learning might arise from its ashes.” */
-    return 0.5f * diff * diff;
-}
-
-
-
-/*
- * And the Lord looked upon the multitudes of targets and outputs and proclaimed:
- * “Let there be gathering of errors,” and so this function was ordained.
- */
-static inline float toterr(const float * const tg,
-                           const float * const o,
-                           const int size)
-{
-    float sum = 0.0f;
-
-#if defined(__APPLE__)
-    // — Accelerated vectorized path: sum = 0.5 * ∑(tg - o)^2 —
-    float *diff = (float*)malloc(size * sizeof(float));
-    if (!diff) {
-        // fallback if memory allocation fails
-        for (int i = 0; i < size; ++i) {
-            sum += err(tg[i], o[i]);
-        }
-        return sum;
-    }
-
-    // diff = tg - o
-    vDSP_vsub(o, 1, tg, 1, diff, 1, size);
-
-    // diff = diff^2
-    vDSP_vsq(diff, 1, diff, 1, size);
-
-    // sum = ∑(diff)
-    vDSP_sve(diff, 1, &sum, size);
-    free(diff);
-
-    return 0.5f * sum;
-#else
-    // — Scalar fallback path —
-    const float *tg_ptr = tg;
-    const float *o_ptr  = o;
-    for (int i = 0; i < size; ++i) {
-        sum += err(*tg_ptr++, *o_ptr++);
-    }
-    return sum;
+#if defined(_MSC_VER) || defined(FWC_NO_VLA)
+    free(delta_h);
+    free(delta_o);
 #endif
 }
 
 
+static inline void wbrand(const NeuralNetwork_Type nn) {
+    const int nips = nn.nips;
+    const int nhid = nn.nhid;
+    const int nops = nn.nops;
 
-/*
- * And the Lord spake, “Let there be a measure of error,”
- * and so was born this blessed function.
- */
-static inline float pderr(const float a, const float b) {
-    /* “Behold, the difference between prediction and target:
-     * for therein lies the path to correction.” */
-    return a - b;
+    float *w = nn.w;  /* input→hidden (nhid×nips), row-major */
+    float *x = nn.x;  /* hidden→output (nops×nhid), row-major */
+    float *b = nn.b;  /* b[0]=hidden bias, b[1]=output bias */
+
+    /* -------- Hidden layer init --------
+       - If FWC_RELU_HID: He (Kaiming) uniform for ReLU
+       - Else: Xavier (Glorot) uniform for sigmoid/tanh
+    */
+#if defined(FWC_RELU_HID)
+    const float limit_h = sqrtf(6.0f / (float)nips);                 /* He uniform */
+#else
+    const float limit_h = sqrtf(6.0f / ((float)nips + (float)nhid)); /* Xavier uniform */
+#endif
+
+    for (int j = 0; j < nhid; ++j) {
+        for (int i = 0; i < nips; ++i) {
+            w[(size_t)j * nips + i] = (2.0f * frand() - 1.0f) * limit_h;
+        }
+    }
+
+    /* -------- Output layer init --------
+       Use Xavier uniform for softmax/sigmoid outputs (works well regardless of hidden nonlinearity).
+    */
+    const float limit_o = sqrtf(6.0f / ((float)nhid + (float)nops)); /* Xavier uniform */
+    for (int k = 0; k < nops; ++k) {
+        for (int j = 0; j < nhid; ++j) {
+            x[(size_t)k * nhid + j] = (2.0f * frand() - 1.0f) * limit_o;
+        }
+    }
+
+    /* -------- Biases -------- */
+    b[0] = 0.0f;  /* hidden bias */
+    b[1] = 0.0f;  /* output bias */
 }
 
+
+
+/* 0.5 * sum_i (tg[i] - o[i])^2  — portable & fast (no malloc, no vDSP) */
+static inline float toterr(const float *restrict tg,
+                           const float *restrict o,
+                           const int size)
+{
+    float sum = 0.0f;
+    /* Let the compiler/OMP vectorize & reduce */
+    #if defined(_OPENMP)
+    #pragma omp simd reduction(+:sum)
+    #endif
+    for (int i = 0; i < size; ++i) {
+        const float d = tg[i] - o[i];
+        sum = fmaf(d, d, sum);   /* sum += d*d with one rounding */
+    }
+    return 0.5f * sum;
+}
 
 
 /* Exposed Functions in Header File */
@@ -348,65 +329,6 @@ float * NNpredict(const NeuralNetwork_Type nn,
 }
 
 
-/* ──────────────────────────────────────────────────────────────────── */
-/*  σ_fast for an entire slab in-place: y = 0.5 * (x / (1+|x|)) + 0.5  */
-/*  Works in two flavours                                               */
-/*      • N < 256  → simple scalar loop                                 */
-/*      • N ≥ 256  → Accelerate vDSP vector path                        */
-/* ──────────────────────────────────────────────────────────────────── */
-static void slab_fast_sigmoid(float *buf, size_t N)
-{
-    static float *recip_buf = NULL;
-    static size_t recip_cap = 0;
-
-    /* ---------- small slabs: cheap scalar loop -------------------- */
-    if (N < 256) {
-        for (size_t i = 0; i < N; ++i) {
-            float x = buf[i];
-            buf[i] = 0.5f * (x / (1.0f + fabsf(x))) + 0.5f;
-        }
-        return;
-    }
-
-    /* ---------- big slabs: vDSP pipeline with reusable buffer ----- */
-    if (N > recip_cap) {
-        float *new_buf = realloc(recip_buf, N * sizeof(float));
-        if (!new_buf) {
-            // fallback if memory allocation fails
-            for (size_t i = 0; i < N; ++i) {
-                float x = buf[i];
-                buf[i] = 0.5f * (x / (1.0f + fabsf(x))) + 0.5f;
-            }
-            return;
-        }
-        recip_buf = new_buf;
-        recip_cap = N;
-    }
-
-    float *recip = recip_buf;
-
-    /* Step 1: recip = |x| */
-    vDSP_vabs(buf, 1, recip, 1, N);
-
-    /* Step 2: recip = 1 + recip */
-    const float one = 1.0f;
-    vDSP_vsadd(recip, 1, &one, recip, 1, N);
-
-    /* Step 3: recip = 1 / recip */
-    vDSP_svdiv(&one, recip, 1, recip, 1, N);
-
-    /* Step 4: buf = buf * recip */
-    vDSP_vmul(buf, 1, recip, 1, buf, 1, N);
-
-    /* Step 5: buf = 0.5 * buf */
-    const float half = 0.5f;
-    vDSP_vsmul(buf, 1, &half, buf, 1, N);
-
-    /* Step 6: buf += 0.5 */
-    vDSP_vsadd(buf, 1, &half, buf, 1, N);
-}
-
-
 /* ---------- NEW public function ----------------------------------- */
 void NNpredict_batch(const NeuralNetwork_Type nn,
                      const float *batch_in,
@@ -417,53 +339,69 @@ void NNpredict_batch(const NeuralNetwork_Type nn,
     const int nhid = nn.nhid;
     const int nops = nn.nops;
 
-    // ── 1) scratch buffer H[B×nhid], reused across calls ───────────
+    // 1) scratch H[B×nhid] (NOTE: static => not thread-safe)
     static float *H = NULL;
     static size_t Hcap = 0;
-    size_t needH = (size_t)B * nhid;
+    const size_t needH = (size_t)B * nhid;
     if (Hcap < needH) {
         free(H);
-        H = malloc(needH * sizeof *H);
+        H = (float*)malloc(needH * sizeof *H);
         Hcap = needH;
     }
 
-    // ── 2) input→hidden: big GEMM ─────────────────────────────────
+    // 2) input→hidden
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 B, nhid, nips,
                 1.0f,
-                batch_in,  nips,
-                nn.w,       nips,
+                batch_in, nips,
+                nn.w,     nips,
                 0.0f,
-                H,          nhid);
+                H,        nhid);
 
-    // ── 3) hidden bias + sigmoid, fused & OpenMP-parallel ─────────
+    // 3) hidden bias + activation
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for (size_t i = 0; i < needH; ++i) {
-        float z = H[i] + nn.b[0];
+        const float z = H[i] + nn.b[0];
         H[i] = fast_sigmoid(z);
     }
 
-    // ── 4) hidden→output: big GEMM ────────────────────────────────
+    // 4) hidden→output
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 B, nops, nhid,
                 1.0f,
-                H,          nhid,
-                nn.x,       nhid,
+                H,    nhid,
+                nn.x, nhid,
                 0.0f,
-                batch_out,  nops);
+                batch_out, nops);
 
-    // ── 5) output bias + sigmoid, fused & OpenMP-parallel ─────────
-    size_t needO = (size_t)B * nops;
+    // 5) output epilogue: softmax (nops>1) or sigmoid
+    const size_t needO = (size_t)B * nops;
+    if (nops > 1) {
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static)
 #endif
-    for (size_t i = 0; i < needO; ++i) {
-        float z = batch_out[i] + nn.b[1];
-        batch_out[i] = fast_sigmoid(z);
+        for (int r = 0; r < B; ++r) {
+            float *row = batch_out + (size_t)r * nops;
+            float m = -FLT_MAX;
+            for (int i = 0; i < nops; ++i) { row[i] += nn.b[1]; if (row[i] > m) m = row[i]; }
+            float s = 0.f;
+            for (int i = 0; i < nops; ++i) { row[i] = expf(row[i] - m); s += row[i]; }
+            const float invs = s > 0.f ? (1.0f / s) : 1.0f;
+            for (int i = 0; i < nops; ++i) row[i] *= invs;
+        }
+    } else {
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (size_t i = 0; i < needO; ++i) {
+            const float z = batch_out[i] + nn.b[1];
+            batch_out[i] = fast_sigmoid(z);
+        }
     }
 }
+
 
 
 NeuralNetwork_Type NNbuild(int nips, int nhid, int nops) {
@@ -478,33 +416,44 @@ NeuralNetwork_Type NNbuild(int nips, int nhid, int nops) {
     const int nb = 2;
     nn.nb = nb;
 
-    // 3) Compute weight‐matrix sizes once
+    // 3) Compute weight-matrix sizes once
     const int wih = nips * nhid;        // input→hidden
     const int who = nhid * nops;        // hidden→output
     nn.nw = wih + who;
 
     // 4) Allocate weights (w) and set x to the hidden→output subarray
-    nn.w = calloc(nn.nw, sizeof *nn.w);
+    nn.w = (float*)calloc((size_t)nn.nw, sizeof *nn.w);
     if (!nn.w) goto fail_w;
     nn.x = nn.w + wih;
 
     // 5) Allocate biases
-    nn.b = calloc(nb, sizeof *nn.b);
+    nn.b = (float*)calloc((size_t)nb, sizeof *nn.b);
     if (!nn.b) goto fail_b;
 
-    // 6) Allocate hidden‐layer buffer
-    nn.h = calloc(nhid, sizeof *nn.h);
+    // 6) Allocate hidden-layer buffer
+    nn.h = (float*)calloc((size_t)nhid, sizeof *nn.h);
     if (!nn.h) goto fail_h;
 
-    // 7) Allocate output‐layer buffer
-    nn.o = calloc(nops, sizeof *nn.o);
+    // 7) Allocate output-layer buffer
+    nn.o = (float*)calloc((size_t)nops, sizeof *nn.o);
     if (!nn.o) goto fail_o;
 
-    // 8) Initialize weights & biases
+#if defined(FWC_CACHE_Z)
+    // 8) Allocate hidden pre-activations (z) cache (optional)
+    nn.hz = (float*)calloc((size_t)nhid, sizeof *nn.hz);
+    if (!nn.hz) goto fail_hz;
+    /* If you ever enable oz for binary output, allocate it here as well. */
+#endif
+
+    // 9) Initialize weights & biases
     wbrand(nn);
     return nn;
 
   // --- error cleanup ---
+#if defined(FWC_CACHE_Z)
+fail_hz:
+    free(nn.o);
+#endif
 fail_o:
     free(nn.h);
 fail_h:
@@ -513,8 +462,9 @@ fail_b:
     free(nn.w);
 fail_w:
     // return zeroed struct on failure
-    return (NeuralNetwork_Type){0};  /* compound literal: all fields zero */
+    return (NeuralNetwork_Type){0};
 }
+
 
 
 /* nn.c (already contains static fprop & static bprop) */
@@ -678,22 +628,17 @@ void NNprint(const float * arr, const int size)
  * freeing outputs, hidden, biases, and weights,
  * that no clutter remain.
  */
+/* Free buffers in creation order (safe if any are NULL) */
 void NNfree(const NeuralNetwork_Type nn)
 {
-    float * const o = nn.o;
-    float * const h = nn.h;
-    float * const b = nn.b;
-    float * const w = nn.w;
-
-    /* “Let the last made be the first unmade,” 
-       and so did the outputs return to the void. */
-    free(o);
-    /* “Next did the hidden depart,” */
-    free(h);
-    /* “Then were the biases loosed from their bonds,” */
-    free(b);
-    /* “And finally the weights faded into nothingness.” */
-    free(w);
+    free(nn.o);
+    free(nn.h);
+    free(nn.b);
+#if defined(FWC_CACHE_Z)
+    free(nn.hz);
+    /* free(nn.oz);  // if you add it later */
+#endif
+    free(nn.w);
 }
 
 
@@ -706,51 +651,154 @@ void NNfree(const NeuralNetwork_Type nn)
  */
 void NNdestroy(NeuralNetwork_Type *nn)
 {
-    if (!nn) {
-        /* No network instance provided; nothing to free */
-        return;
-    }
-
-    /* Deallocate all dynamically allocated buffers */
-    free(nn->w);  /* weight matrices */
-    free(nn->b);  /* bias vectors */
-    free(nn->h);  /* hidden-layer activations */
-    free(nn->o);  /* output-layer activations */
-
-    /* Clear entire structure to invalidate stale pointers and reset fields */
+    if (!nn) return;
+    free(nn->w);
+    free(nn->b);
+    free(nn->h);
+    free(nn->o);
+#if defined(FWC_CACHE_Z)
+    free(nn->hz);
+    /* free(nn->oz); */
+#endif
     memset(nn, 0, sizeof *nn);
 }
 
 
-/*
- * Chapter: Mini‐Batch Backpropagation in FRAMEWORK-C
- *
- * We seek to minimize the empirical risk:
- *   R(θ) = (1/B) ∑ₙ L(f(xₙ;θ), yₙ)
- * by gradient descent on batches of B samples.
- */
-/*
- * Chapter: Mini-Batch Training by Composing fprop & bprop
- *
- * Here we simply invoke your existing per-sample routines
- * fprop(...) and bprop(...) over each example in the batch.
- */
 void NNtrain_batch(NeuralNetwork_Type *nn,
                    int B,
                    const float *X,    /* B×nips inputs, row-major */
-                   const float *Y,    /* B×nops one-hot targets   */
-                   float lr)          /* learning rate η          */
+                   const float *Y,    /* B×nops targets           */
+                   float lr)
 {
-    int nips = nn->nips;
-    int nops = nn->nops;
-    /* For each example in the batch: forward then backward */
-    for (int i = 0; i < B; ++i) {
-        const float *x_i = X + (size_t)i * nips;
-        const float *y_i = Y + (size_t)i * nops;
-        /* 1) Compute all activations for sample i */
-        fprop(*nn, x_i);
-        /* 2) Back-propagate error and update weights */
-        bprop(*nn, x_i, y_i, lr);
-    }
-}
+    const int nips = nn->nips;
+    const int nhid = nn->nhid;
+    const int nops = nn->nops;
 
+    /* ---- scratch (static to avoid hot-path malloc/free) ---- */
+    static float *H = NULL, *O = NULL, *DO = NULL, *DH = NULL;
+    static size_t capH = 0, capO = 0, capDO = 0, capDH = 0;
+
+    const size_t needH  = (size_t)B * (size_t)nhid;
+    const size_t needO  = (size_t)B * (size_t)nops;
+
+    if (capH  < needH) { free(H);  H  = (float*)malloc(needH * sizeof *H);  capH  = needH; }
+    if (capO  < needO) { free(O);  O  = (float*)malloc(needO * sizeof *O);  capO  = needO; }
+    if (capDO < needO) { free(DO); DO = (float*)malloc(needO * sizeof *DO); capDO = needO; }
+    if (capDH < needH) { free(DH); DH = (float*)malloc(needH * sizeof *DH); capDH = needH; }
+    if (!H || !O || !DO || !DH) return;
+
+    /* 1) H = X · W^T  (B×nhid) */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                B, nhid, nips,
+                1.0f,
+                X,      nips,
+                nn->w,  nips,
+                0.0f,
+                H,      nhid);
+
+    /* 2) hidden bias + activation (fused) */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (size_t i = 0; i < needH; ++i) {
+        const float z = H[i] + nn->b[0];
+        H[i] = fast_sigmoid(z);  /* swap to ReLU if you enable FWC_RELU_HID */
+    }
+
+    /* 3) O = H · X^T  (B×nops) */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                B, nops, nhid,
+                1.0f,
+                H,      nhid,
+                nn->x,  nhid,
+                0.0f,
+                O,      nops);
+
+    /* 4) output epilogue + deltas DO */
+    if (nops > 1) {
+        /* softmax + CE: DO = softmax(O+bo) - Y */
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int r = 0; r < B; ++r) {
+            float *o = O + (size_t)r * nops;
+            const float *y = Y + (size_t)r * nops;
+
+            float m = -FLT_MAX;
+            for (int i = 0; i < nops; ++i) { o[i] += nn->b[1]; if (o[i] > m) m = o[i]; }
+            float s = 0.0f;
+            for (int i = 0; i < nops; ++i) { o[i] = expf(o[i] - m); s += o[i]; }
+            const float invs = (s > 0.0f) ? (1.0f / s) : 1.0f;
+            for (int i = 0; i < nops; ++i) {
+                o[i] *= invs;
+                DO[(size_t)r * nops + i] = o[i] - y[i];
+            }
+        }
+    } else {
+        /* sigmoid: DO = σ(O+bo) - Y  (BCE-style gradient) */
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (size_t i = 0; i < needO; ++i) {
+            const float z  = O[i] + nn->b[1];
+            const float oi = fast_sigmoid(z);
+            DO[i] = oi - Y[i];
+            O[i]  = oi; /* keep post-activation if you want it later */
+        }
+    }
+
+    /* 5) DH = DO · X (hidden deltas before nonlinearity)  (B×nhid) */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                B, nhid, nops,
+                1.0f,
+                DO,     nops,
+                nn->x,  nhid,
+                0.0f,
+                DH,     nhid);
+
+    /* 6) multiply by activation derivative at hidden (sigmoid) */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (size_t i = 0; i < needH; ++i) {
+        const float hi = H[i];               /* H holds σ(z) */
+        DH[i] *= hi * (1.0f - hi);           /* σ'(z) = σ(z)(1-σ(z)) */
+        /* If you switch to ReLU and cache z: DH[i] *= (z > 0.0f); */
+    }
+
+    /* 7) SGD update (ONCE per batch) — use AVERAGED gradient */
+    const float nrate = -lr / (float)B;
+
+    /* nn->x ← nn->x + nrate * (DO^T · H)   -> (nops×nhid) */
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                nops, nhid, B,
+                nrate,
+                DO, nops,
+                H,  nhid,
+                1.0f,
+                nn->x, nhid);
+
+    /* nn->w ← nn->w + nrate * (DH^T · X)   -> (nhid×nips) */
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                nhid, nips, B,
+                nrate,
+                DH, nhid,
+                X,  nips,
+                1.0f,
+                nn->w, nips);
+
+    /* 8) bias updates (also averaged) */
+    float sum_do = 0.0f, sum_dh = 0.0f;
+#ifdef _OPENMP
+    #pragma omp parallel for reduction(+:sum_do)
+#endif
+    for (size_t i = 0; i < needO; ++i) sum_do += DO[i];
+
+#ifdef _OPENMP
+    #pragma omp parallel for reduction(+:sum_dh)
+#endif
+    for (size_t i = 0; i < needH; ++i) sum_dh += DH[i];
+
+    nn->b[1] += nrate * sum_do;
+    nn->b[0] += nrate * sum_dh;
+}

@@ -26,12 +26,12 @@ from torch.utils.data import TensorDataset, DataLoader
 # ─── Config ────────────────────────────────────────────────────────
 DATA_DIR = Path("data/MNIST")
 NIPS, NHID, NOPS = 28 * 28, 128, 10
-EPOCHS = 10
+EPOCHS = 64
 LR_C, LR_T = 0.1, 0.1
-BATCH_T = 256
-DEVICE = "cpu"  # force CPU
+BATCH_C = 256          # mini-batch size for FRAMEWORK-C
+BATCH_T = 256         # mini-batch size for PyTorch
+DEVICE = "cpu"        # force CPU
 
-# ─── IDX loader ────────────────────────────────────────────────────
 def _open_idx(fn: Path):
     if fn.exists():
         return fn.open("rb")
@@ -84,17 +84,14 @@ net_t = nn.Sequential(
 opt_t  = optim.SGD(net_t.parameters(), lr=LR_T, momentum=0.9)
 loss_t = nn.CrossEntropyLoss()
 
-# DataLoader (single-process) for PyTorch
-X_tr_t = torch.from_numpy(X_tr.copy())
-Y_tr_t = torch.from_numpy(Y_tr.copy()).long()
 loader = DataLoader(
-    TensorDataset(X_tr_t, Y_tr_t),
+    TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(Y_tr).long()),
     batch_size=BATCH_T, shuffle=True, num_workers=0
 )
 
 # ─── 4) Epoch 0 baseline ───────────────────────────────────────────
 print("Epoch |  C-val(%) | Torch-val(%) | Δt-C(s) | Δt-T(s)")
-print("------+-----------+-------------+--------+--------")
+print("------+-----------+-------------+---------+---------")
 
 out_va_c = fc.predict_batch(net_c, X_va)
 acc_c0   = (out_va_c.argmax(1) == Y_va).mean() * 100
@@ -104,27 +101,37 @@ with torch.no_grad():
     logits0 = net_t(torch.from_numpy(X_va).to(DEVICE)).cpu()
 acc_t0 = (logits0.argmax(1).numpy() == Y_va).mean() * 100
 
-print(f"{0:5d} | {acc_c0:9.2f} | {acc_t0:12.2f} | {0.0:6.3f} | {0.0:6.3f}")
+print(f"{0:5d} | {acc_c0:9.2f} | {acc_t0:12.2f} | {0.0:7.3f} | {0.0:7.3f}")
 
 # ─── 5) Training loop ─────────────────────────────────────────────
 total_c = total_t = 0.0
 n_train = X_tr.shape[0]
+
 for ep in range(1, EPOCHS + 1):
-    # FRAMEWORK-C (normalize full-batch learning rate)
+    # Learning-rate schedule for FRAMEWORK-C and PyTorch
+    lr_c = LR_C * (0.95 ** (ep - 1))
+    lr_t = LR_T * (0.95 ** (ep - 1))
+    for g in opt_t.param_groups:
+        g['lr'] = lr_t
+
+    # FRAMEWORK-C: mini-batch SGD
     t0 = time.perf_counter()
-    fc.train_batch(net_c, X_tr, Y_tr_c, LR_C)
+    for i in range(0, n_train, BATCH_C):
+        xb = X_tr[i : i + BATCH_C]
+        yb = Y_tr_c[i : i + BATCH_C]
+        fc.train_batch(net_c, xb, yb, lr_c)
     dt_c = time.perf_counter() - t0
     total_c += dt_c
     out_va_c = fc.predict_batch(net_c, X_va)
-    acc_c = (out_va_c.argmax(1) == Y_va).mean() * 100
+    acc_c   = (out_va_c.argmax(1) == Y_va).mean() * 100
 
     # PyTorch
     t0 = time.perf_counter()
     net_t.train()
-    for xb, yb in loader:
-        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+    for xb_t, yb_t in loader:
+        xb_t, yb_t = xb_t.to(DEVICE), yb_t.to(DEVICE)
         opt_t.zero_grad()
-        loss_t(net_t(xb), yb).backward()
+        loss_t(net_t(xb_t), yb_t).backward()
         opt_t.step()
     dt_t = time.perf_counter() - t0
     total_t += dt_t
@@ -133,21 +140,20 @@ for ep in range(1, EPOCHS + 1):
         logits = net_t(torch.from_numpy(X_va).to(DEVICE)).cpu()
     acc_t = (logits.argmax(1).numpy() == Y_va).mean() * 100
 
-    print(f"{ep:5d} | {acc_c:9.2f} | {acc_t:12.2f} | {dt_c:6.3f} | {dt_t:6.3f}")
+    print(f"{ep:5d} | {acc_c:9.2f} | {acc_t:12.2f} | {dt_c:7.3f} | {dt_t:7.3f}")
 
 # ─── 6) Test accuracy & inference ─────────────────────────────────
-out_te_c  = fc.predict_batch(net_c, X_te)
-acc_c_te  = (out_te_c.argmax(1) == Y_te).mean() * 100
+out_te_c = fc.predict_batch(net_c, X_te)
+acc_c_te = (out_te_c.argmax(1) == Y_te).mean() * 100
 
 net_t.eval()
 with torch.no_grad():
     logits_te = net_t(torch.from_numpy(X_te).to(DEVICE)).cpu()
-acc_t_te  = (logits_te.argmax(1).numpy() == Y_te).mean() * 100
+acc_t_te = (logits_te.argmax(1).numpy() == Y_te).mean() * 100
 
 print(f"\nTest Accuracies: C={acc_c_te:.2f}%  Torch={acc_t_te:.2f}%")
 
 def bench(fn, reps=20):
-    """Return best time in seconds."""
     best_t = float("inf")
     for _ in range(reps):
         t0 = time.perf_counter()
@@ -155,18 +161,17 @@ def bench(fn, reps=20):
         best_t = min(best_t, time.perf_counter() - t0)
     return best_t
 
-# measure batch inference in seconds
 inf_c = bench(lambda: fc.predict_batch(net_c, X_te))
 inf_t = bench(lambda: net_t(torch.from_numpy(X_te).to(DEVICE)).cpu())
 
 print(f"\nBatch inference (best-of-20):")
-print(f"  C    : {inf_c:6.4f} s /10k samples")
-print(f"  Torch: {inf_t:6.4f} s /10k samples")
+print(f"  C    : {inf_c:7.4f} s /10k samples")
+print(f"  Torch: {inf_t:7.4f} s /10k samples")
 
 print(f"\nTotal training time:")
 print(f"  C    : {total_c:.3f} s")
 print(f"  Torch: {total_t:.3f} s")
 
-print(f"\nTraining time (avg per epoch):")
-print(f"  C    : {total_c / EPOCHS:.3f} s")
-print(f"  Torch: {total_t / EPOCHS:.3f} s")
+print(f"\nAvg time/epoch:")
+print(f"  C    : {total_c/EPOCHS:.3f} s")
+print(f"  Torch: {total_t/EPOCHS:.3f} s")
