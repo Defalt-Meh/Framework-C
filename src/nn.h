@@ -32,6 +32,11 @@ typedef struct
     int nips;   /* Number of inputs */
     int nhid;   /* Number of hidden neurons */
     int nops;   /* Number of outputs */
+    /* Optional second hidden layer (used only if nhid2 > 0) */
+    int   nhid2;   /* 0 => disabled (1 hidden layer), >0 => enabled */
+    float *u;      /* h1→h2 weights: (nhid2 × nhid) row-major */
+    float *h2;     /* activations of second hidden layer (nhid2) */
+
 } NeuralNetwork_Type;
 
 /* Exposed Functions */

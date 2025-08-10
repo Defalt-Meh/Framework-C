@@ -4,18 +4,19 @@ benchmark_mnist.py
 ==================
 MNIST benchmark: FRAMEWORK-C (via my_module.c API) vs. PyTorch.
 
-• Reports epoch 0 (untrained) validation accuracy  
-• Runs 10 training epochs, printing per-epoch val accuracy & times  
-• Final test classification accuracy  
+• Reports epoch 0 (untrained) validation accuracy
+• Runs 10 training epochs, printing per-epoch val accuracy & times
+• Final test classification accuracy
 • Batch-inference latency (best of 20) for both models, shown in seconds
 """
 
 import gzip
 import struct
 import time
+import os
+from pathlib import Path
 
 import numpy as np
-from pathlib import Path
 import frameworkc as fc
 
 import torch
@@ -26,11 +27,16 @@ from torch.utils.data import TensorDataset, DataLoader
 # ─── Config ────────────────────────────────────────────────────────
 DATA_DIR = Path("data/MNIST")
 NIPS, NHID, NOPS = 28 * 28, 128, 10
-EPOCHS = 64
+EPOCHS = 128
 LR_C, LR_T = 0.1, 0.1
-BATCH_C = 256          # mini-batch size for FRAMEWORK-C
-BATCH_T = 256         # mini-batch size for PyTorch
-DEVICE = "cpu"        # force CPU
+BATCH_C = 256           # mini-batch size for FRAMEWORK-C
+BATCH_T = 256           # mini-batch size for PyTorch
+DEVICE = "cpu"          # force CPU
+
+# Make PyTorch actually use your CPU
+torch.set_num_threads(os.cpu_count() or 1)
+# (Optional) fewer interop threads can help on some BLAS builds:
+# torch.set_num_interop_threads(max(1, (os.cpu_count() or 2)//2))
 
 def _open_idx(fn: Path):
     if fn.exists():
@@ -72,6 +78,14 @@ X_va, Y_va = X_all[va], Y_all[va]
 Y_tr_c = np.eye(NOPS, dtype=np.float32)[Y_tr]
 Y_va_c = np.eye(NOPS, dtype=np.float32)[Y_va]
 
+# Torch tensors cached once (no per-epoch NumPy→Torch churn)
+X_tr_t = torch.from_numpy(X_tr).to(DEVICE)
+Y_tr_t = torch.from_numpy(Y_tr).long().to(DEVICE)
+X_va_t = torch.from_numpy(X_va).to(DEVICE)
+Y_va_t = torch.from_numpy(Y_va).long().to(DEVICE)
+X_te_t = torch.from_numpy(X_te).to(DEVICE)
+Y_te_t = torch.from_numpy(Y_te).long().to(DEVICE)
+
 # ─── 3) Build networks ─────────────────────────────────────────────
 net_c = fc.build(NIPS, NHID, NOPS, 42)
 
@@ -81,25 +95,34 @@ net_t = nn.Sequential(
     nn.ReLU(),
     nn.Linear(NHID, NOPS),
 ).to(DEVICE)
+
+# Try PyTorch 2.x compile for CPU. Falls back if unavailable.
+try:
+    net_t = torch.compile(net_t, mode="reduce-overhead", fullgraph=False)  # or "max-autotune"
+except Exception:
+    pass
+
 opt_t  = optim.SGD(net_t.parameters(), lr=LR_T, momentum=0.9)
 loss_t = nn.CrossEntropyLoss()
 
 loader = DataLoader(
-    TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(Y_tr).long()),
-    batch_size=BATCH_T, shuffle=True, num_workers=0
+    TensorDataset(X_tr_t, Y_tr_t),
+    batch_size=BATCH_T, shuffle=True,
+    num_workers=0,  # data is already in RAM tensors; extra workers just add overhead
+    persistent_workers=False
 )
 
 # ─── 4) Epoch 0 baseline ───────────────────────────────────────────
 print("Epoch |  C-val(%) | Torch-val(%) | Δt-C(s) | Δt-T(s)")
 print("------+-----------+-------------+---------+---------")
 
-out_va_c = fc.predict_batch(net_c, X_va)
+out_va_c = fc.predict_batch(net_c, X_va)  # Framework-C expects NumPy
 acc_c0   = (out_va_c.argmax(1) == Y_va).mean() * 100
 
 net_t.eval()
-with torch.no_grad():
-    logits0 = net_t(torch.from_numpy(X_va).to(DEVICE)).cpu()
-acc_t0 = (logits0.argmax(1).numpy() == Y_va).mean() * 100
+with torch.inference_mode():
+    logits0 = net_t(X_va_t)
+acc_t0 = (logits0.argmax(1).eq(Y_va_t)).float().mean().item() * 100
 
 print(f"{0:5d} | {acc_c0:9.2f} | {acc_t0:12.2f} | {0.0:7.3f} | {0.0:7.3f}")
 
@@ -108,7 +131,7 @@ total_c = total_t = 0.0
 n_train = X_tr.shape[0]
 
 for ep in range(1, EPOCHS + 1):
-    # Learning-rate schedule for FRAMEWORK-C and PyTorch
+    # Learning-rate schedule for FRAMEWORK-C and PyTorch (match)
     lr_c = LR_C * (0.95 ** (ep - 1))
     lr_t = LR_T * (0.95 ** (ep - 1))
     for g in opt_t.param_groups:
@@ -125,20 +148,22 @@ for ep in range(1, EPOCHS + 1):
     out_va_c = fc.predict_batch(net_c, X_va)
     acc_c   = (out_va_c.argmax(1) == Y_va).mean() * 100
 
-    # PyTorch
+    # PyTorch (pure CPU)
     t0 = time.perf_counter()
     net_t.train()
     for xb_t, yb_t in loader:
-        xb_t, yb_t = xb_t.to(DEVICE), yb_t.to(DEVICE)
-        opt_t.zero_grad()
-        loss_t(net_t(xb_t), yb_t).backward()
+        opt_t.zero_grad(set_to_none=True)
+        out = net_t(xb_t)
+        loss = loss_t(out, yb_t)
+        loss.backward()
         opt_t.step()
     dt_t = time.perf_counter() - t0
     total_t += dt_t
+
     net_t.eval()
-    with torch.no_grad():
-        logits = net_t(torch.from_numpy(X_va).to(DEVICE)).cpu()
-    acc_t = (logits.argmax(1).numpy() == Y_va).mean() * 100
+    with torch.inference_mode():
+        logits = net_t(X_va_t)
+    acc_t = (logits.argmax(1).eq(Y_va_t)).float().mean().item() * 100
 
     print(f"{ep:5d} | {acc_c:9.2f} | {acc_t:12.2f} | {dt_c:7.3f} | {dt_t:7.3f}")
 
@@ -147,13 +172,16 @@ out_te_c = fc.predict_batch(net_c, X_te)
 acc_c_te = (out_te_c.argmax(1) == Y_te).mean() * 100
 
 net_t.eval()
-with torch.no_grad():
-    logits_te = net_t(torch.from_numpy(X_te).to(DEVICE)).cpu()
-acc_t_te = (logits_te.argmax(1).numpy() == Y_te).mean() * 100
+with torch.inference_mode():
+    logits_te = net_t(X_te_t)
+acc_t_te = (logits_te.argmax(1).eq(Y_te_t)).float().mean().item() * 100
 
 print(f"\nTest Accuracies: C={acc_c_te:.2f}%  Torch={acc_t_te:.2f}%")
 
-def bench(fn, reps=20):
+def bench(fn, reps=20, warmup=3):
+    # Warmup (JIT/compile/cache)
+    for _ in range(warmup):
+        fn()
     best_t = float("inf")
     for _ in range(reps):
         t0 = time.perf_counter()
@@ -161,8 +189,17 @@ def bench(fn, reps=20):
         best_t = min(best_t, time.perf_counter() - t0)
     return best_t
 
+# Build a Torch inference-only copy (JIT) for fair latency bench
+net_t_inf = net_t
+try:
+    net_t_inf = torch.jit.script(net_t.eval())
+    net_t_inf = torch.jit.optimize_for_inference(net_t_inf)
+except Exception:
+    pass
+
 inf_c = bench(lambda: fc.predict_batch(net_c, X_te))
-inf_t = bench(lambda: net_t(torch.from_numpy(X_te).to(DEVICE)).cpu())
+with torch.inference_mode():
+    inf_t = bench(lambda: net_t_inf(X_te_t))
 
 print(f"\nBatch inference (best-of-20):")
 print(f"  C    : {inf_c:7.4f} s /10k samples")

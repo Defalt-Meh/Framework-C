@@ -1,6 +1,20 @@
 #include "nn.h"
 #include <stdlib.h>
 #include <math.h>          /* fabsf */
+/* helpers near the top (after includes) */
+#define BH_PTR(nn)  ((nn).b)                             /* hidden biases: nhid  */
+#define BO_PTR(nn)  ((nn).b + (nn).nhid)                 /* output biases: nops  */
+
+/* for 2-layer nets */
+#define BH1_PTR(nn) ((nn).b)                             /* nhid   */
+#define BH2_PTR(nn) ((nn).b + (nn).nhid)                 /* nhid2  */
+#define BO2_PTR(nn) ((nn).b + (nn).nhid + (nn).nhid2)    /* nops   */
+
+#ifndef FWC_RELU_HID
+#error "FWC_RELU_HID not defined: you're training with sigmoid!"
+#endif
+
+
 
 /* ───────────────────── OPENMP selection ─────────────────── */
 #ifdef _OPENMP
@@ -60,13 +74,61 @@ static inline float fast_sigmoid_grad(float x)
     return 0.5f * inv * inv;                        // 0.5 / (1+|x|)^2
 }
 
+/* Fused, numerically-stable softmax + CE for one row.
+   - logits: length n; if write_probs!=0, overwritten with probabilities
+   - y:      one-hot targets in {0,1}
+   - delta:  output (softmax - y)
+   - bias:   scalar output bias (nn->b[1])
+   Returns per-row CE loss (you can ignore the return). */
+static inline float softmax_ce_fused_row(float *restrict logits,
+                                         const float *restrict y,
+                                         float *restrict delta,
+                                         const int n,
+                                         const float bias,
+                                         const int write_probs)
+{
+    float m = logits[0] + bias;
+    for (int i = 1; i < n; ++i) {
+        const float z = logits[i] + bias;
+        if (z > m) m = z;
+    }
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) s += expf((logits[i] + bias) - m);
+    const float logZ = logf(s) + m;
+
+    float loss = 0.0f;
+    const float inv_guard = 1e-20f;  /* avoid log(0) */
+    for (int i = 0; i < n; ++i) {
+        const float p = expf((logits[i] + bias) - logZ);
+        delta[i] = p - y[i];
+        if (write_probs) logits[i] = p;
+        loss -= y[i] * logf(p + inv_guard);
+    }
+    return loss;
+}
+
+/* Mean CE over a batch (softmax case). If DO!=NULL, also fills deltas. */
+static inline float softmax_ce_batch(float *O_logits, const float *Y,
+                                     float *DO, int B, int nops, float bias)
+{
+    float sum = 0.0f;
+    for (int r = 0; r < B; ++r) {
+        float *o_row       = O_logits + (size_t)r * nops;
+        const float *y_row = Y        + (size_t)r * nops;
+        float *d_row       = DO ? (DO + (size_t)r * nops) : (float*)0;
+        sum += softmax_ce_fused_row(o_row, y_row, d_row ? d_row : (float[1]){0},
+                                    nops, bias, /*write_probs=*/0);
+    }
+    return sum / (float)B;
+}
 
 
 
 
 /* ───────────────────────────────────────────────────────────────── */
 
-/* Portable, fused, softmax-capable forward pass (fixed & polished) */
+/* Portable, fused, softmax-capable forward pass (ReLU-ready) */
+/* Bias layout assumed: b[0..nhid-1]=hidden, b[nhid..nhid+nops-1]=output */
 static void fprop(const NeuralNetwork_Type nn, const float * const in)
 {
     const int nips = nn.nips;
@@ -75,7 +137,10 @@ static void fprop(const NeuralNetwork_Type nn, const float * const in)
 
     const float *w = nn.w;  /* input→hidden  (nhid × nips), row-major */
     const float *x = nn.x;  /* hidden→output (nops × nhid), row-major */
-    const float *b = nn.b;  /* b[0]=hidden bias, b[1]=output bias (scalar) */
+    const float *b = nn.b;  /* per-unit biases (hidden then output)   */
+    const float *bh = b;               /* hidden biases: nhid */
+    const float *bo = b + nhid;        /* output biases: nops */
+
     float       *h = nn.h;  /* hidden activations */
     float       *o = nn.o;  /* output activations */
 
@@ -95,15 +160,17 @@ static void fprop(const NeuralNetwork_Type nn, const float * const in)
     }
 #endif
 
-    /* Fuse bias + activation for hidden */
-    const float bh = b[0];
+    /* -------- Hidden epilogue: per-unit bias + activation -------- */
     for (int j = 0; j < nhid; ++j) {
-        const float z = h[j] + bh;
+        const float z = h[j] + bh[j];
 #if defined(FWC_CACHE_Z)
-        nn.hz[j] = z;            /* <-- needed for fast_sigmoid_grad in bprop */
+        nn.hz[j] = z;                      /* keep pre-activation if needed */
 #endif
-        h[j] = fast_sigmoid(z);
-        /* For ReLU speed, swap to: h[j] = z > 0.f ? z : 0.f; */
+#if defined(FWC_RELU_HID)
+        h[j] = (z > 0.0f) ? z : 0.0f;      /* ReLU */
+#else
+        h[j] = fast_sigmoid(z);            /* Sigmoid */
+#endif
     }
 
     /* -------- Output: o = h · x^T -------- */
@@ -124,9 +191,8 @@ static void fprop(const NeuralNetwork_Type nn, const float * const in)
 
     /* -------- Output epilogue -------- */
     if (nops > 1) {  /* stable softmax */
-        const float bo = b[1];
         float m = -FLT_MAX;
-        for (int i = 0; i < nops; ++i) { o[i] += bo; if (o[i] > m) m = o[i]; }
+        for (int i = 0; i < nops; ++i) { o[i] += bo[i]; if (o[i] > m) m = o[i]; }
         float s = 0.0f;
         for (int i = 0; i < nops; ++i) { o[i] = expf(o[i] - m); s += o[i]; }
         const float invs = s > 0.0f ? (1.0f / s) : 1.0f;
@@ -134,16 +200,12 @@ static void fprop(const NeuralNetwork_Type nn, const float * const in)
         return;
     }
 
-    /* binary / regression-like path: sigmoid */
-    {
-        const float bo = b[1];
-        for (int i = 0; i < nops; ++i) {
-            const float z = o[i] + bo;
-            o[i] = fast_sigmoid(z);
-        }
+    /* binary / regression-like path: sigmoid output */
+    for (int i = 0; i < nops; ++i) {
+        const float z = o[i] + bo[i];
+        o[i] = fast_sigmoid(z);
     }
 }
-
 
 static void bprop(const NeuralNetwork_Type nn,
                   const float *in,
@@ -154,7 +216,7 @@ static void bprop(const NeuralNetwork_Type nn,
 
     float *restrict W = nn.w;
     float *restrict X = nn.x;
-    float *restrict b = nn.b;
+    float *restrict b = nn.b;          /* layout assumed: [bh(0..nhid-1) | bo(0..nops-1)] */
     float *restrict h = nn.h;
     float *restrict o = nn.o;
 
@@ -175,14 +237,16 @@ static void bprop(const NeuralNetwork_Type nn,
 
     /* 1) Output deltas */
     if (nops > 1) {
+        /* softmax + cross-entropy: grad = p - y */
         for (int j = 0; j < nops; ++j)
-            delta_o[j] = o[j] - tg[j];                  /* softmax + CE */
+            delta_o[j] = o[j] - tg[j];
     } else {
+        /* sigmoid + BCE (or MSE-style): grad = (σ - y) * σ'(z)  ; here σ stored in o */
         for (int j = 0; j < nops; ++j) {
             const float oj  = o[j];
             const float err = oj - tg[j];
 #if defined(FWC_CACHE_Z)
-            /* If you cache oz and use fast_sigmoid at output, prefer:
+            /* If oz cached and using fast_sigmoid at output, prefer:
                delta_o[j] = err * fast_sigmoid_grad(oz[j]); */
             delta_o[j] = err * oj * (1.0f - oj);
 #else
@@ -209,11 +273,9 @@ static void bprop(const NeuralNetwork_Type nn,
 #else
     for (int i = 0; i < nhid; ++i) {
     #if defined(FWC_CACHE_Z)
-        /* exact grad of fast_sigmoid using cached z */
-        delta_h[i] *= fast_sigmoid_grad(hz[i]);
+        delta_h[i] *= fast_sigmoid_grad(hz[i]);   /* exact grad for fast_sigmoid */
     #else
-        /* fallback: classic logistic derivative using h */
-        const float hi = h[i];
+        const float hi = h[i];                    /* fallback: logistic' using h */
         delta_h[i] *= hi * (1.0f - hi);
     #endif
     }
@@ -230,20 +292,12 @@ static void bprop(const NeuralNetwork_Type nn,
     cblas_sger(CblasRowMajor, nhid, nips, nrate,
                delta_h, 1, in, 1, W, nips);
 
-    /* Biases (scalar per layer) */
-    float sum_do = 0.0f, sum_dh = 0.0f;
-    int j = 0;
-    for (; j <= nops - 4; j += 4)
-        sum_do += delta_o[j] + delta_o[j+1] + delta_o[j+2] + delta_o[j+3];
-    for (; j < nops; ++j) sum_do += delta_o[j];
+    /* 4) Per‑unit bias updates (instead of scalar layer biases) */
+    float *bh = b;            /* hidden biases: nhid elements */
+    float *bo = b + nhid;     /* output biases: nops elements */
 
-    int i = 0;
-    for (; i <= nhid - 4; i += 4)
-        sum_dh += delta_h[i] + delta_h[i+1] + delta_h[i+2] + delta_h[i+3];
-    for (; i < nhid; ++i) sum_dh += delta_h[i];
-
-    b[1] += nrate * sum_do;
-    b[0] += nrate * sum_dh;
+    for (int i = 0; i < nops; ++i)  bo[i] += nrate * delta_o[i];
+    for (int j = 0; j < nhid; ++j)  bh[j] += nrate * delta_h[j];
 
 #if defined(_MSC_VER) || defined(FWC_NO_VLA)
     free(delta_h);
@@ -252,14 +306,16 @@ static void bprop(const NeuralNetwork_Type nn,
 }
 
 
+
 static inline void wbrand(const NeuralNetwork_Type nn) {
     const int nips = nn.nips;
     const int nhid = nn.nhid;
     const int nops = nn.nops;
 
-    float *w = nn.w;  /* input→hidden (nhid×nips), row-major */
-    float *x = nn.x;  /* hidden→output (nops×nhid), row-major */
-    float *b = nn.b;  /* b[0]=hidden bias, b[1]=output bias */
+    float *w  = nn.w;   /* input→hidden (nhid×nips), row-major */
+    float *x  = nn.x;   /* hidden→output (nops×nhid), row-major */
+    float *bh = nn.b;               /* hidden biases start here */
+    float *bo = nn.b + nhid;        /* output biases follow */
 
     /* -------- Hidden layer init --------
        - If FWC_RELU_HID: He (Kaiming) uniform for ReLU
@@ -278,9 +334,9 @@ static inline void wbrand(const NeuralNetwork_Type nn) {
     }
 
     /* -------- Output layer init --------
-       Use Xavier uniform for softmax/sigmoid outputs (works well regardless of hidden nonlinearity).
+       Use Xavier uniform for softmax/sigmoid outputs
     */
-    const float limit_o = sqrtf(6.0f / ((float)nhid + (float)nops)); /* Xavier uniform */
+    const float limit_o = sqrtf(6.0f / ((float)nhid + (float)nops));
     for (int k = 0; k < nops; ++k) {
         for (int j = 0; j < nhid; ++j) {
             x[(size_t)k * nhid + j] = (2.0f * frand() - 1.0f) * limit_o;
@@ -288,8 +344,54 @@ static inline void wbrand(const NeuralNetwork_Type nn) {
     }
 
     /* -------- Biases -------- */
-    b[0] = 0.0f;  /* hidden bias */
-    b[1] = 0.0f;  /* output bias */
+    for (int j = 0; j < nhid; ++j) bh[j] = 0.0f;  /* hidden biases */
+    for (int i = 0; i < nops; ++i) bo[i] = 0.0f;  /* output biases */
+}
+
+
+/* ─────────────────────────────────────────────────────────── */
+/* 2-hidden-layer builder                                     */
+/* in → h1(nhid) → h2(nhid2) → out(nops)                      */
+/* ─────────────────────────────────────────────────────────── */
+static inline void wbrand2(const NeuralNetwork_Type nn)
+{
+    const int nips  = nn.nips;
+    const int nhid  = nn.nhid;
+    const int nhid2 = nn.nhid2;
+    const int nops  = nn.nops;
+
+    float *w = nn.w;   /* input→h1 (nhid×nips) */
+    float *u = nn.u;   /* h1→h2   (nhid2×nhid) */
+    float *x = nn.x;   /* h2→out  (nops×nhid2) */
+    float *b = nn.b;   /* b[0]=h1, b[1]=h2, b[2]=out */
+
+    /* He/Xavier limits */
+#if defined(FWC_RELU_HID)
+    const float lim_h1 = sqrtf(6.0f / (float)nips);
+#else
+    const float lim_h1 = sqrtf(6.0f / ((float)nips + (float)nhid));
+#endif
+    const float lim_h2 = sqrtf(6.0f / ((float)nhid + (float)nhid2));
+    const float lim_o  = sqrtf(6.0f / ((float)nhid2 + (float)nops));
+
+    /* W: input→h1 */
+    for (int j = 0; j < nhid; ++j)
+        for (int i = 0; i < nips; ++i)
+            w[(size_t)j*nips + i] = (2.0f*frand()-1.0f)*lim_h1;
+
+    /* U: h1→h2 */
+    for (int j = 0; j < nhid2; ++j)
+        for (int i = 0; i < nhid; ++i)
+            u[(size_t)j*nhid + i] = (2.0f*frand()-1.0f)*lim_h2;
+
+    /* X: h2→out */
+    for (int k = 0; k < nops; ++k)
+        for (int j = 0; j < nhid2; ++j)
+            x[(size_t)k*nhid2 + j] = (2.0f*frand()-1.0f)*lim_o;
+
+    b[0] = 0.0f;  /* h1 bias */
+    b[1] = 0.0f;  /* h2 bias */
+    b[2] = 0.0f;  /* out bias */
 }
 
 
@@ -358,14 +460,19 @@ void NNpredict_batch(const NeuralNetwork_Type nn,
                 0.0f,
                 H,        nhid);
 
-    // 3) hidden bias + activation
+// 3) hidden bias + activation   (FIX: respect FWC_RELU_HID here, too)
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
-    for (size_t i = 0; i < needH; ++i) {
-        const float z = H[i] + nn.b[0];
-        H[i] = fast_sigmoid(z);
-    }
+for (size_t i = 0; i < needH; ++i) {
+    const float z = H[i] + nn.b[0];
+#if defined(FWC_RELU_HID)
+    H[i] = (z > 0.0f) ? z : 0.0f;   /* ReLU (matches NNtrain_batch) */
+#else
+    H[i] = fast_sigmoid(z);         /* Sigmoid (old path) */
+#endif
+}
+
 
     // 4) hidden→output
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -406,65 +513,113 @@ void NNpredict_batch(const NeuralNetwork_Type nn,
 
 NeuralNetwork_Type NNbuild(int nips, int nhid, int nops) {
     NeuralNetwork_Type nn;
+    nn.nips = nips; nn.nhid = nhid; nn.nops = nops;
 
-    // 1) Store dimensions up-front
-    nn.nips = nips;
-    nn.nhid = nhid;
-    nn.nops = nops;
-
-    // 2) Fixed bias count
-    const int nb = 2;
-    nn.nb = nb;
-
-    // 3) Compute weight-matrix sizes once
-    const int wih = nips * nhid;        // input→hidden
-    const int who = nhid * nops;        // hidden→output
+    nn.nb = nhid + nops;                 /* CHANGED: per‑unit biases */
+    const int wih = nips * nhid;
+    const int who = nhid * nops;
     nn.nw = wih + who;
 
-    // 4) Allocate weights (w) and set x to the hidden→output subarray
     nn.w = (float*)calloc((size_t)nn.nw, sizeof *nn.w);
     if (!nn.w) goto fail_w;
     nn.x = nn.w + wih;
 
-    // 5) Allocate biases
-    nn.b = (float*)calloc((size_t)nb, sizeof *nn.b);
+    nn.b = (float*)calloc((size_t)nn.nb, sizeof *nn.b);  /* CHANGED size */
     if (!nn.b) goto fail_b;
 
-    // 6) Allocate hidden-layer buffer
     nn.h = (float*)calloc((size_t)nhid, sizeof *nn.h);
     if (!nn.h) goto fail_h;
-
-    // 7) Allocate output-layer buffer
     nn.o = (float*)calloc((size_t)nops, sizeof *nn.o);
     if (!nn.o) goto fail_o;
 
 #if defined(FWC_CACHE_Z)
-    // 8) Allocate hidden pre-activations (z) cache (optional)
     nn.hz = (float*)calloc((size_t)nhid, sizeof *nn.hz);
     if (!nn.hz) goto fail_hz;
-    /* If you ever enable oz for binary output, allocate it here as well. */
 #endif
 
-    // 9) Initialize weights & biases
     wbrand(nn);
     return nn;
 
-  // --- error cleanup ---
 #if defined(FWC_CACHE_Z)
-fail_hz:
-    free(nn.o);
+fail_hz: free(nn.o);
 #endif
-fail_o:
-    free(nn.h);
-fail_h:
-    free(nn.b);
-fail_b:
-    free(nn.w);
-fail_w:
-    // return zeroed struct on failure
-    return (NeuralNetwork_Type){0};
+fail_o:  free(nn.h);
+fail_h:  free(nn.b);
+fail_b:  free(nn.w);
+fail_w:  return (NeuralNetwork_Type){0};
 }
 
+
+NeuralNetwork_Type NNbuild2(int nips, int nhid, int nhid2, int nops) {
+    NeuralNetwork_Type nn;
+    nn.nips = nips; nn.nhid = nhid; nn.nhid2 = nhid2 > 0 ? nhid2 : nhid; nn.nops = nops;
+
+    nn.nb = nhid + nn.nhid2 + nops;      /* CHANGED: per‑unit biases */
+
+    const int wih  = nips * nhid;
+    const int h2h1 = nhid * nn.nhid2;
+    const int who  = nn.nhid2 * nops;
+    nn.nw = wih + h2h1 + who;
+
+    nn.w = (float*)calloc((size_t)nn.nw, sizeof *nn.w);
+    if (!nn.w) goto fail_w;
+    nn.u = nn.w + wih;
+    nn.x = nn.u + h2h1;
+
+    nn.b = (float*)calloc((size_t)nn.nb, sizeof *nn.b);  /* CHANGED size */
+    if (!nn.b) goto fail_b;
+
+    nn.h  = (float*)calloc((size_t)nhid, sizeof *nn.h);
+    if (!nn.h) goto fail_h;
+    nn.h2 = (float*)calloc((size_t)nn.nhid2, sizeof *nn.h2);
+    if (!nn.h2) goto fail_h2;
+    nn.o  = (float*)calloc((size_t)nops, sizeof *nn.o);
+    if (!nn.o) goto fail_o;
+
+#if defined(FWC_CACHE_Z)
+    nn.hz = (float*)calloc((size_t)nhid, sizeof *nn.hz);
+    if (!nn.hz) goto fail_hz;
+#endif
+
+    wbrand2(nn);
+    return nn;
+
+#if defined(FWC_CACHE_Z)
+fail_hz: free(nn.o);
+#endif
+fail_o:  free(nn.h2);
+fail_h2: free(nn.h);
+fail_h:  free(nn.b);
+fail_b:  free(nn.w);
+fail_w:  return (NeuralNetwork_Type){0};
+}
+
+
+/* ─────────────────────────────────────────────────────────── */
+/* Auto‑depth builder: decides inside the function             */
+/* Pass dataset size N; tweak thresholds as you like           */
+/* ─────────────────────────────────────────────────────────── */
+#ifndef FWC_AUTO_N_SMALL
+#define FWC_AUTO_N_SMALL  10000    /* <10k → 1 layer */
+#endif
+#ifndef FWC_AUTO_N_MED
+#define FWC_AUTO_N_MED    50000    /* 10k–50k → 2 layers (smaller h2) */
+#endif
+
+NeuralNetwork_Type NNbuild_auto(int nips, int nhid, int nops, long long N)
+{
+    if (N < FWC_AUTO_N_SMALL) {
+        /* small dataset → 1 hidden layer */
+        return NNbuild(nips, nhid, nops);
+    }
+
+    /* medium/large dataset → 2 hidden layers */
+    int nhid2;
+    if (N < FWC_AUTO_N_MED) nhid2 = nhid > 1 ? (nhid/2) : nhid;  /* conservative */
+    else                    nhid2 = nhid;                         /* same width */
+
+    return NNbuild2(nips, nhid, nhid2, nops);
+}
 
 
 /* nn.c (already contains static fprop & static bprop) */
@@ -664,6 +819,21 @@ void NNdestroy(NeuralNetwork_Type *nn)
 }
 
 
+#ifndef FWC_DROPOUT
+#define FWC_DROPOUT 0          /* set to 1 to enable hidden-layer dropout */
+#endif
+#ifndef FWC_DROPOUT_P
+#define FWC_DROPOUT_P 0.20f    /* drop probability */
+#endif
+
+/* tiny RNG for stochastic mask */
+static inline uint32_t fwc_xorshift32(uint32_t *s){
+    *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5; return *s;
+}
+static inline float fwc_rand01(uint32_t *s){
+    return (fwc_xorshift32(s) & 0x00FFFFFF) / 16777216.0f; /* [0,1) */
+}
+
 void NNtrain_batch(NeuralNetwork_Type *nn,
                    int B,
                    const float *X,    /* B×nips inputs, row-major */
@@ -678,6 +848,14 @@ void NNtrain_batch(NeuralNetwork_Type *nn,
     static float *H = NULL, *O = NULL, *DO = NULL, *DH = NULL;
     static size_t capH = 0, capO = 0, capDO = 0, capDH = 0;
 
+#if FWC_DROPOUT
+    static uint8_t *M = NULL;   /* dropout mask for hidden activations */
+    static size_t capM = 0;
+    const float p_drop = FWC_DROPOUT_P;
+    const float keep   = 1.0f - p_drop;          /* inverted dropout scale */
+    uint32_t seed = 0x9e3779b9u;                 /* per-call seed; make global if you want reproducibility across calls */
+#endif
+
     const size_t needH  = (size_t)B * (size_t)nhid;
     const size_t needO  = (size_t)B * (size_t)nops;
 
@@ -685,7 +863,14 @@ void NNtrain_batch(NeuralNetwork_Type *nn,
     if (capO  < needO) { free(O);  O  = (float*)malloc(needO * sizeof *O);  capO  = needO; }
     if (capDO < needO) { free(DO); DO = (float*)malloc(needO * sizeof *DO); capDO = needO; }
     if (capDH < needH) { free(DH); DH = (float*)malloc(needH * sizeof *DH); capDH = needH; }
-    if (!H || !O || !DO || !DH) return;
+#if FWC_DROPOUT
+    if (capM  < needH) { free(M);  M  = (uint8_t*)malloc(needH * sizeof *M); capM  = needH; }
+#endif
+    if (!H || !O || !DO || !DH
+#if FWC_DROPOUT
+        || !M
+#endif
+    ) return;
 
     /* 1) H = X · W^T  (B×nhid) */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -696,13 +881,26 @@ void NNtrain_batch(NeuralNetwork_Type *nn,
                 0.0f,
                 H,      nhid);
 
-    /* 2) hidden bias + activation (fused) */
+    /* 2) hidden bias + activation (Sigmoid or ReLU) + (optional) inverted dropout */
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for (size_t i = 0; i < needH; ++i) {
         const float z = H[i] + nn->b[0];
-        H[i] = fast_sigmoid(z);  /* swap to ReLU if you enable FWC_RELU_HID */
+    #if defined(FWC_RELU_HID)
+        float a = (z > 0.0f) ? z : 0.0f;   /* ReLU */
+    #else
+        float a = fast_sigmoid(z);         /* Sigmoid */
+    #endif
+    #if FWC_DROPOUT
+        /* generate/record mask */
+        float u = fwc_rand01(&seed);
+        uint8_t m = (u >= p_drop);       /* keep if u>=p_drop */
+        M[i] = m;
+        H[i] = m ? (a / keep) : 0.0f;    /* inverted dropout keeps expectation */
+    #else
+        H[i] = a;
+    #endif
     }
 
     /* 3) O = H · X^T  (B×nops) */
@@ -714,28 +912,19 @@ void NNtrain_batch(NeuralNetwork_Type *nn,
                 0.0f,
                 O,      nops);
 
-    /* 4) output epilogue + deltas DO */
+    /* 4) output epilogue + deltas DO (softmax + CE fused for nops>1) */
     if (nops > 1) {
-        /* softmax + CE: DO = softmax(O+bo) - Y */
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
         for (int r = 0; r < B; ++r) {
-            float *o = O + (size_t)r * nops;
-            const float *y = Y + (size_t)r * nops;
-
-            float m = -FLT_MAX;
-            for (int i = 0; i < nops; ++i) { o[i] += nn->b[1]; if (o[i] > m) m = o[i]; }
-            float s = 0.0f;
-            for (int i = 0; i < nops; ++i) { o[i] = expf(o[i] - m); s += o[i]; }
-            const float invs = (s > 0.0f) ? (1.0f / s) : 1.0f;
-            for (int i = 0; i < nops; ++i) {
-                o[i] *= invs;
-                DO[(size_t)r * nops + i] = o[i] - y[i];
-            }
+            float       *o_row = O  + (size_t)r * nops;  /* logits row */
+            const float *y_row = Y  + (size_t)r * nops;  /* target row */
+            float       *d_row = DO + (size_t)r * nops;  /* delta row  */
+            (void)softmax_ce_fused_row(o_row, y_row, d_row, nops, nn->b[1], /*write_probs=*/1);
         }
     } else {
-        /* sigmoid: DO = σ(O+bo) - Y  (BCE-style gradient) */
+        /* sigmoid output: DO = σ(O+bo) - Y  (BCE-style gradient) */
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
@@ -743,11 +932,11 @@ void NNtrain_batch(NeuralNetwork_Type *nn,
             const float z  = O[i] + nn->b[1];
             const float oi = fast_sigmoid(z);
             DO[i] = oi - Y[i];
-            O[i]  = oi; /* keep post-activation if you want it later */
+            O[i]  = oi;
         }
     }
 
-    /* 5) DH = DO · X (hidden deltas before nonlinearity)  (B×nhid) */
+    /* 5) DH = DO · X  (B×nhid) */
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                 B, nhid, nops,
                 1.0f,
@@ -756,20 +945,27 @@ void NNtrain_batch(NeuralNetwork_Type *nn,
                 0.0f,
                 DH,     nhid);
 
-    /* 6) multiply by activation derivative at hidden (sigmoid) */
+    /* 6) multiply by activation derivative at hidden (and gate with dropout mask) */
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for (size_t i = 0; i < needH; ++i) {
-        const float hi = H[i];               /* H holds σ(z) */
-        DH[i] *= hi * (1.0f - hi);           /* σ'(z) = σ(z)(1-σ(z)) */
-        /* If you switch to ReLU and cache z: DH[i] *= (z > 0.0f); */
+    #if FWC_DROPOUT
+        if (!M[i]) { DH[i] = 0.0f; continue; }  /* dropped units carry no gradient */
+    #endif
+    #if defined(FWC_RELU_HID)
+        /* ReLU' using post-activation (H already includes dropout scaling) */
+        DH[i] *= (H[i] > 0.0f) ? 1.0f : 0.0f;
+    #else
+        const float hi = H[i];                  /* H holds σ(z) (possibly scaled) */
+        DH[i] *= hi * (1.0f - hi);              /* sigmoid' */
+    #endif
     }
 
-    /* 7) SGD update (ONCE per batch) — use AVERAGED gradient */
+    /* 7) SGD update (averaged over batch) */
     const float nrate = -lr / (float)B;
 
-    /* nn->x ← nn->x + nrate * (DO^T · H)   -> (nops×nhid) */
+    /* X ← X + nrate * (DO^T · H)   -> (nops×nhid) */
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                 nops, nhid, B,
                 nrate,
@@ -778,7 +974,7 @@ void NNtrain_batch(NeuralNetwork_Type *nn,
                 1.0f,
                 nn->x, nhid);
 
-    /* nn->w ← nn->w + nrate * (DH^T · X)   -> (nhid×nips) */
+    /* W ← W + nrate * (DH^T · X)   -> (nhid×nips) */
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                 nhid, nips, B,
                 nrate,
@@ -787,7 +983,7 @@ void NNtrain_batch(NeuralNetwork_Type *nn,
                 1.0f,
                 nn->w, nips);
 
-    /* 8) bias updates (also averaged) */
+    /* 8) Biases (averaged) */
     float sum_do = 0.0f, sum_dh = 0.0f;
 #ifdef _OPENMP
     #pragma omp parallel for reduction(+:sum_do)

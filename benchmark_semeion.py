@@ -1,123 +1,139 @@
 #!/usr/bin/env python3
 """
 benchmark_semeion.py – FRAMEWORK-C vs. PyTorch on the Semeion digits task
------------------------------------------------------------------
-* loads semeion.data
-* 80 / 20 stratified split
-* trains both models for a few epochs (using batch APIs)
-* prints loss, accuracy, and training times per epoch
-* shows final test quality
-* shows raw inference speed (best-of timing)
-- vectorized C training via `train_batch`
-- x1.3 times slower in training compared to torch
+Fixes:
+- Mini-batch SGD for FRAMEWORK-C (was full-batch)
+- Cosine LR schedule (+ tiny warmup)
+- Standardize features (fit on train)
+- Cross-entropy reporting (matches C's softmax+CE path)
 """
 
-import time
-import math
-import pathlib
-
+import time, math, pathlib
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
 import frameworkc as fc
 
-
 # ───── hyper-parameters ─────────────────────────────────────────────
-EPOCHS = 128            # enough to hit ≈92 % on both nets
-BATCH  = 256            # mini-batch size for torch
-LR_C   = 0.05           # learning-rate C   (plain SGD)
-LR_T   = 0.01           # learning-rate torch (Adam)
+SEED   = 1
+EPOCHS = 128
+BATCH  = 128             # use same order for both C and Torch
+LR_C   = 0.08            # base LR for C (cosine-decayed)
+LR_T   = 5e-3            # AdamW LR often stable here
+WARMUP_EPOCHS = 3
 DATA   = pathlib.Path("data/semeion.data")
+
+rng = np.random.default_rng(SEED)
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
 # ───── load & split data ────────────────────────────────────────────
 raw = np.loadtxt(DATA, dtype=np.float32)
-x, t = raw[:, :256], raw[:, 256:]
-labels = t.argmax(axis=1)
+X, T = raw[:, :256], raw[:, 256:]
+y    = T.argmax(axis=1)
 
-rng = np.random.default_rng(0)
-idx = rng.permutation(len(x))
-split = int(0.8 * len(x))
+idx = rng.permutation(len(X))
+split = int(0.8 * len(X))
 tr, te = idx[:split], idx[split:]
 
-x_tr, t_tr, lbl_tr = x[tr], t[tr], labels[tr]
-x_te, t_te, lbl_te = x[te], t[te], labels[te]
+X_tr, T_tr, y_tr = X[tr], T[tr], y[tr]
+X_te, T_te, y_te = X[te], T[te], y[te]
 
-# Pre-convert to float32 contiguous arrays for batch C calls
-X_tr = x_tr.astype(np.float32)
-Y_tr = t_tr.astype(np.float32)
-X_te = x_te.astype(np.float32)
-Y_te = t_te.astype(np.float32)
+# ───── standardize inputs (fit on train only) ───────────────────────
+mu  = X_tr.mean(axis=0, keepdims=True)
+std = X_tr.std(axis=0, keepdims=True) + 1e-6
+X_tr = (X_tr - mu) / std
+X_te = (X_te - mu) / std
 
-nips, nhid, nops = 256, 28, 10
+# ensure float32 contiguous for C calls
+X_tr = np.ascontiguousarray(X_tr, dtype=np.float32)
+T_tr = np.ascontiguousarray(T_tr, dtype=np.float32)
+X_te = np.ascontiguousarray(X_te, dtype=np.float32)
+T_te = np.ascontiguousarray(T_te, dtype=np.float32)
 
-# ───── build networks ───────────────────────────────────────────────
-cnet = fc.build(nips, nhid, nops, 1)
+nips, nhid, nops = 256, 64, 10  # a bit wider helps with CE
+
+# ───── build nets ───────────────────────────────────────────────────
+cnet = fc.build(nips, nhid, nops, SEED)
 
 torch_net = nn.Sequential(
     nn.Linear(nips, nhid),
-    nn.Sigmoid(),
-    nn.Linear(nhid, nops),
-    nn.Sigmoid(),
+    nn.ReLU(),                 # match C’s ReLU-ready path if compiled that way
+    nn.Linear(nhid, nops),     # logits
 )
-opt     = optim.Adam(torch_net.parameters(), lr=LR_T)
-loss_fn = nn.MSELoss()
+opt     = optim.AdamW(torch_net.parameters(), lr=LR_T, weight_decay=1e-4)
+ce_loss = nn.CrossEntropyLoss()   # expects class indices
 
-# ───── helper functions ─────────────────────────────────────────────
+# ───── helpers ──────────────────────────────────────────────────────
+def cosine_lr(base_lr, t, T, warmup=WARMUP_EPOCHS):
+    if t < warmup:  # linear warmup
+        return base_lr * (t + 1) / max(1, warmup)
+    t_adj = min(max(t - warmup, 0), max(T - warmup, 1))
+    return 0.5 * base_lr * (1 + math.cos(math.pi * t_adj / max(T - warmup, 1)))
+
 def accuracy_from_onehot(net_out: np.ndarray, target_onehot: np.ndarray) -> float:
-    pred = net_out.argmax(1)
-    true = target_onehot .argmax(1)
-    return (pred == true).mean() * 100.0
+    return (net_out.argmax(1) == target_onehot.argmax(1)).mean() * 100.0
+
+def cross_entropy_onehot(probs: np.ndarray, onehot: np.ndarray, eps=1e-9) -> float:
+    # probs should be softmax outputs (FRAMEWORK-C already returns probs for nops>1)
+    return float(-(onehot * np.log(probs + eps)).sum() / probs.shape[0])
 
 def c_batch_predict(x_arr: np.ndarray) -> np.ndarray:
-    """Vectorised C inference returning an (N × nops) array."""
     return fc.predict_batch(cnet, x_arr)
 
-# ───── training loop with timing ────────────────────────────────────
+# ───── training loop ────────────────────────────────────────────────
+print("Epoch |   C-CE    C-acc   | Torch-CE  Torch-acc | Δt-C(s) | Δt-T(s)")
+print("------+--------------------+---------------------+---------+---------")
+
 total_c = total_t = 0.0
+N = len(X_tr)
 
-print("Epoch |   C-loss  C-acc   | Torch-loss Torch-acc | Δt-C(s) | Δt-T(s)")
-print("------+--------------------+-----------------------+---------+---------")
 for ep in range(1, EPOCHS + 1):
-    lr_decay = LR_C * (0.97 ** (ep - 1))
+    # shuffle indices
+    perm = rng.permutation(N)
+    lr_c = cosine_lr(LR_C, ep - 1, EPOCHS)
 
-    # ---- FRAMEWORK-C batch training ----
+    # ---- FRAMEWORK-C mini-batch training ----
     t0 = time.perf_counter()
-    fc.train_batch(cnet, X_tr, Y_tr, lr_decay)
+    for i in range(0, N, BATCH):
+        sel = perm[i:i+BATCH]
+        xb  = X_tr[sel]
+        tb  = T_tr[sel]
+        # mini-batch SGD step in C
+        fc.train_batch(cnet, xb, tb, lr_c)
     dt_c = time.perf_counter() - t0
     total_c += dt_c
 
-    # compute C loss & acc on training set
+    # compute C CE & acc on training set
     out_c_tr = c_batch_predict(X_tr)
-    loss_c   = float(np.mean((out_c_tr - Y_tr) ** 2))
-    acc_c    = accuracy_from_onehot(out_c_tr, Y_tr)
+    ce_c     = cross_entropy_onehot(out_c_tr, T_tr)
+    acc_c    = accuracy_from_onehot(out_c_tr, T_tr)
 
-    # ---- PyTorch (Adam) batch training ----
+    # ---- PyTorch mini-batch training (AdamW + CE) ----
     torch_net.train()
-    loss_t = 0.0
-    hits_t = 0
-
     t0 = time.perf_counter()
-    for i in range(0, len(X_tr), BATCH):
-        xb = torch.from_numpy(X_tr[i : i + BATCH])
-        tb = torch.from_numpy(Y_tr[i : i + BATCH])
-        opt.zero_grad()
-        out = torch_net(xb)
-        l   = loss_fn(out, tb)
-        l.backward()
+    loss_sum = 0.0
+    hits_sum = 0
+    for i in range(0, N, BATCH):
+        sel = perm[i:i+BATCH]
+        xb = torch.from_numpy(X_tr[sel])
+        yb = torch.from_numpy(y_tr[sel])
+        opt.zero_grad(set_to_none=True)
+        logits = torch_net(xb)
+        loss   = ce_loss(logits, yb)
+        loss.backward()
         opt.step()
-
-        loss_t += l.item() * xb.size(0)
-        hits_t += (out.argmax(1) == tb.argmax(1)).sum().item()
+        with torch.no_grad():
+            loss_sum += loss.item() * xb.size(0)
+            hits_sum += (logits.argmax(1) == yb).sum().item()
     dt_t = time.perf_counter() - t0
     total_t += dt_t
 
-    loss_t /= len(X_tr)
-    acc_t   = hits_t / len(X_tr) * 100.0
+    ce_t  = loss_sum / N
+    acc_t = hits_sum / N * 100.0
 
-    print(f"{ep:5d} | {loss_c:8.4f} {acc_c:7.2f} |"
-          f" {loss_t:8.4f} {acc_t:7.2f} |"
+    print(f"{ep:5d} | {ce_c:8.4f} {acc_c:7.2f} | {ce_t:8.4f} {acc_t:7.2f} |"
           f" {dt_c:7.3f} | {dt_t:7.3f}")
 
 print("\n===== Total Training Time =====")
@@ -125,20 +141,21 @@ print(f" FRAMEWORK-C : {total_c:.3f} s")
 print(f" PyTorch     : {total_t:.3f} s")
 print("===============================")
 
-# ───── final test accuracy & quality ───────────────────────────────
-out_c_te = c_batch_predict(X_te)
-out_t_te = torch_net(torch.from_numpy(X_te)).detach().numpy()
+# ───── final test quality ───────────────────────────────────────────
+out_c_te = c_batch_predict(X_te)                                      # probs
+logits_t = torch_net(torch.from_numpy(X_te)).detach().numpy()
+probs_t  = torch.softmax(torch.from_numpy(logits_t), dim=1).numpy()
 
-acc_c = (out_c_te .argmax(1) == lbl_te).mean() * 100.0
-acc_t = (out_t_te.argmax(1) == lbl_te).mean() * 100.0
-mse_c = float(np.mean((out_c_te - Y_te) ** 2))
-mse_t = float(np.mean((out_t_te - Y_te) ** 2))
+acc_c = (out_c_te.argmax(1) == y_te).mean() * 100.0
+acc_t = (probs_t .argmax(1) == y_te).mean() * 100.0
+ce_c  = cross_entropy_onehot(out_c_te, T_te)
+ce_t  = cross_entropy_onehot(probs_t , T_te)
 
 print("\n===== Test Set Quality =====")
-print("          MSE       Acc(%)")
+print("          CE        Acc(%)")
 print("-----------------------------")
-print(f" C-Net : {mse_c:9.4f} {acc_c:9.2f}")
-print(f" Torch : {mse_t:9.4f} {acc_t:9.2f}")
+print(f" C-Net : {ce_c:9.4f} {acc_c:9.2f}")
+print(f" Torch : {ce_t:9.4f} {acc_t:9.2f}")
 
 # ───── raw inference timing (best-of) ───────────────────────────────
 REPEAT = 30
