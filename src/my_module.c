@@ -1,6 +1,15 @@
 /*
  *  src/my_module.c  –  Python bridge for FRAMEWORK-C
  *  Auto-depth selection is decided INSIDE this module.
+ *
+ *  Overview:
+ *  This file exposes a thin, zero-copy bridge between NumPy arrays and the
+ *  C engine. We pass raw pointers into the C core (while ensuring dtype,
+ *  contiguity, and shape), release the GIL during numerical kernels, and
+ *  employ *lazy materialization*: model memory is only allocated when first
+ *  used. A small heuristic (based on an observed sample count) selects the
+ *  network depth on the fly. Weak-linking NNbuild2 enables optional 2-layer
+ *  builds without hard dependency at link time.
  */
 #define PY_SSIZE_T_CLEAN
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -12,7 +21,12 @@
 #include <string.h>    /* memcpy */
 #include "nn.h"
 
-/* ───────────────────────────── Auto-depth thresholds ───────────────────────── */
+/* ───────────────────────────── Auto-depth thresholds ─────────────────────────
+ * Heuristic guidance:
+ *  - For “small” data, prefer shallower models to control variance.
+ *  - For medium data, two layers but narrower second hidden layer.
+ *  - For large data, two layers of equal width.
+ * These thresholds are module-local defaults; the C core remains agnostic.  */
 #ifndef FWC_AUTO_N_SMALL
 #define FWC_AUTO_N_SMALL  10000   /* <10k → 1 layer */
 #endif
@@ -20,25 +34,33 @@
 #define FWC_AUTO_N_MED    50000   /* 10k–50k → 2 layers (smaller h2) */
 #endif
 
-/* Try to use NNbuild2 if it exists at link time; otherwise this will be NULL. */
+/* Try to use NNbuild2 if it exists at link time; otherwise this will be NULL.
+ * Pedagogical note: a weak symbol allows optional functionality without
+ * link failure. We test its address (&NNbuild2) before calling it. */
 #if defined(__GNUC__) || defined(__clang__)
 extern NeuralNetwork_Type NNbuild2(int nips, int nhid, int nhid2, int nops)
     __attribute__((weak));
 #else
-/* Non-GNU/Clang: declare and assume unavailable (will fallback to NNbuild). */
+/* Non-GNU/Clang: declare and assume unavailable (will fallback to NNbuild).
+ * The pragma is merely advisory; functionality falls back deterministically. */
 extern NeuralNetwork_Type NNbuild2(int nips, int nhid, int nhid2, int nops);
 #pragma message("Warning: weak reference to NNbuild2 not supported; using NNbuild fallback.")
 #endif
 
-/* ─────────────────────────── Internal wrapper handle ───────────────────────── */
+/* ─────────────────────────── Internal wrapper handle ─────────────────────────
+ * We encapsulate configuration and (eventually) the realized C network inside
+ * a PyCapsule-managed heap object. The 'is_built' flag enforces lazy init.   */
 typedef struct {
     int nips, nhid, nops;
-    unsigned seed;
-    int is_built;                /* 0 until first materialization */
-    NeuralNetwork_Type net;      /* valid only when is_built == 1 */
+    unsigned seed;              /* forwarded to srand for initialization noise */
+    int is_built;               /* 0 until first materialization */
+    NeuralNetwork_Type net;     /* valid only when is_built == 1 */
 } FC_Handle;
 
-/* ─────────────────────────── Capsule helpers & dtor ────────────────────────── */
+/* ─────────────────────────── Capsule helpers & dtor ──────────────────────────
+ * Capsule destructor: called when Python GC drops last reference (or module
+ * teardown). We free C-side buffers via NNdestroy and then the handle itself.
+ * NB: Capsule tag "frameworkc.nn" guards against type confusion.             */
 static void capsule_destruct(PyObject *capsule)
 {
     if (!PyCapsule_IsValid(capsule, "frameworkc.nn"))
@@ -55,12 +77,20 @@ static void capsule_destruct(PyObject *capsule)
 }
 
 /* Build the actual C net inside the handle, if not yet built.
-   maybe_N: pass B from train_batch as a proxy for dataset size; 0 if unknown. */
+   maybe_N: pass B from train_batch as a proxy for dataset size; 0 if unknown.
+ *
+ * Mathematical/engineering rationale:
+ *  - Lazy construction avoids paying allocation/init unless we really need it.
+ *  - Random seeding occurs here so repeated builds can be reproducible if
+ *    the same 'seed' is supplied to py_build.
+ *  - Auto-depth logic mirrors the thresholds at the top of the file.
+ *  - If NNbuild2 is not present (weak symbol missing), we degrade gracefully. */
 static int ensure_built(FC_Handle *h, long long maybe_N)
 {
     if (h->is_built) return 1;
 
-    /* Seed RNG (used by wbrand inside NNbuild) */
+    /* Seed RNG (used by wbrand inside NNbuild)
+     * The seed affects initial weight distributions (He/Xavier). */
     srand(h->seed);
 
     /* Decide architecture:
@@ -75,7 +105,8 @@ static int ensure_built(FC_Handle *h, long long maybe_N)
     }
 
     if (use_two) {
-        /* Attempt 2-layer build */
+        /* Attempt 2-layer build
+         * Fallback to 1-layer on allocation failure to preserve liveness. */
         h->net = NNbuild2(h->nips, h->nhid, nhid2, h->nops);
         if (h->net.nw == 0) { /* fallback to 1-layer if allocation failed */
             h->net = NNbuild(h->nips, h->nhid, h->nops);
@@ -87,14 +118,24 @@ static int ensure_built(FC_Handle *h, long long maybe_N)
 
     if (h->net.nw == 0) return 0;
     h->is_built = 1;
+#ifdef FWC_OAT
+    {   static const int grid[] = {1,4,8,16,32,64,128};
+        NN_oat_calibrate(&h->net, grid, (int)(sizeof(grid)/sizeof(grid[0])),
+                         /*repeats*/5, /*target_ms*/-1.0f);
+    }
+#endif
+
     return 1;
 }
 
-/* ───────────────────────────────── py_build ────────────────────────────────── */
-/* build(nips, nhid, nops [, seed]) → capsule
+/* ───────────────────────────────── py_build ──────────────────────────────────
+ * build(nips, nhid, nops [, seed]) → capsule
  * NOTE: does NOT immediately allocate the heavy network;
  *       we lazily materialize on the first training/predict call.
- */
+ *
+ * API contract:
+ *   - Returns a PyCapsule that owns an FC_Handle*. Life-cycle is tied to the
+ *     capsule; its destructor ensures we do not leak C resources.             */
 static PyObject *py_build(PyObject *self, PyObject *args)
 {
     int nips, nhid, nops, seed = 0;
@@ -111,13 +152,21 @@ static PyObject *py_build(PyObject *self, PyObject *args)
     return PyCapsule_New(h, "frameworkc.nn", capsule_destruct);
 }
 
-/* ───────────────────────────── forward decls ──────────────────────────────── */
+/* ───────────────────────────── forward decls ────────────────────────────────
+ * We expose four user-facing entry points: predict, predict_batch, train_one,
+ * and train_batch. All use NumPy C-API for zero-copy access to buffers.     */
 static PyObject *py_predict(PyObject *self, PyObject *args);
 static PyObject *py_predict_batch_fast(PyObject *self, PyObject *args);
 static PyObject *py_train_one(PyObject *self, PyObject *args);
 static PyObject *py_train_batch(PyObject *self, PyObject *args);
+#ifdef FWC_OAT
+static PyObject *py_calibrate(PyObject *self, PyObject *args);
+#endif
 
-/* ─────────────────────────── Method table & init ───────────────────────────── */
+
+/* ─────────────────────────── Method table & init ─────────────────────────────
+ * The module definition is conventional: a small docstring, -1 m_size (no
+ * per-interpreter state), and an array of PyMethodDef entries.               */
 static PyMethodDef Methods[] = {
     {"build",         py_build,              METH_VARARGS,
      "build(nips, nhid, nops [, seed]) -> net_handle"},
@@ -129,6 +178,9 @@ static PyMethodDef Methods[] = {
      "train_one(net, x[nips], t[nops], lr) -> float loss"},
     {"train_batch",   py_train_batch,        METH_VARARGS,
      "train_batch(net, X[B,nips], Y[B,nops], lr) -> None"},
+#ifdef FWC_OAT
+    {"calibrate",     py_calibrate,          METH_VARARGS,  "calibrate(net[, latency_ms, repeats]) -> dict"},
+#endif
     {NULL, NULL, 0, NULL}
 };
 
@@ -142,11 +194,18 @@ static struct PyModuleDef mod = {
 
 PyMODINIT_FUNC PyInit_frameworkc(void)
 {
-    import_array();  /* NumPy C-API init */
+    import_array();  /* NumPy C-API init (must be called before NumPy use) */
     return PyModule_Create(&mod);
 }
 
-/* ────────────────────────────── predict (1D) ──────────────────────────────── */
+/* ────────────────────────────── predict (1D) ────────────────────────────────
+ * Signature: predict(net_capsule, x: float32[nips]) -> float32[nops]
+ * Steps:
+ *   1) Validate capsule/tag and lazily build the net (1-layer default).
+ *   2) Convert input to aligned, C-contiguous float32 without copying if
+ *      possible (FROM_OTF honors flags).
+ *   3) Release the GIL around the pure-C NNpredict call.
+ *   4) Copy the output buffer nn->o into a freshly allocated NumPy array.   */
 static PyObject *py_predict(PyObject *self, PyObject *args)
 {
     PyObject *capsule, *obj;
@@ -179,6 +238,7 @@ static PyObject *py_predict(PyObject *self, PyObject *args)
     float *xin  = (float*)PyArray_DATA(x_arr);
     float *yout = (float*)PyArray_DATA(out);
 
+    /* Numerical kernels are thread-agnostic; release the GIL for throughput. */
     Py_BEGIN_ALLOW_THREADS
     float *o = NNpredict(*nn, xin);
     memcpy(yout, o, (size_t)nn->nops * sizeof(float));
@@ -188,8 +248,11 @@ static PyObject *py_predict(PyObject *self, PyObject *args)
     return (PyObject*)out;
 }
 
-/* ───────────────────────────── predict_batch ──────────────────────────────── */
-/* signature: predict_batch(net_capsule, numpy_in[B,nips]) → numpy_out[B,nops] */
+/* ───────────────────────────── predict_batch ────────────────────────────────
+ * signature: predict_batch(net_capsule, numpy_in[B,nips]) → numpy_out[B,nops]
+ * Batch semantics:
+ *   - Uses a BLAS-accelerated forward path under the hood.
+ *   - The output array is allocated by NumPy; we write into it directly.     */
 static PyObject *py_predict_batch_fast(PyObject *self, PyObject *args)
 {
     PyObject *capsule, *in_obj;
@@ -224,6 +287,7 @@ static PyObject *py_predict_batch_fast(PyObject *self, PyObject *args)
     float *inp  = (float*)PyArray_DATA(in_arr);
     float *outp = (float*)PyArray_DATA(out_arr);
 
+    /* Release GIL while the C engine computes on B samples. */
     Py_BEGIN_ALLOW_THREADS
     NNpredict_batch(*net, inp, B, outp);
     Py_END_ALLOW_THREADS
@@ -232,7 +296,11 @@ static PyObject *py_predict_batch_fast(PyObject *self, PyObject *args)
     return (PyObject*)out_arr;
 }
 
-/* ────────────────────────────── train_one ─────────────────────────────────── */
+/* ────────────────────────────── train_one ───────────────────────────────────
+ * signature: train_one(net, x[nips], t[nops], lr) -> float loss
+ * Didactic note:
+ *   This is classic online SGD. We again ensure dtype/contiguity, then
+ *   call into C and return a Python float with the ½‖t−o‖² loss.            */
 static PyObject *py_train_one(PyObject *self, PyObject *args)
 {
     PyObject *capsule, *x_obj, *t_obj;
@@ -267,6 +335,7 @@ static PyObject *py_train_one(PyObject *self, PyObject *args)
     float *tgt = (float*)PyArray_DATA(t_arr);
 
     float loss;
+    /* Release GIL during compute-intensive step. */
     Py_BEGIN_ALLOW_THREADS
     loss = NNtrain(*nn, xin, tgt, (float)lr);
     Py_END_ALLOW_THREADS
@@ -275,7 +344,17 @@ static PyObject *py_train_one(PyObject *self, PyObject *args)
     return PyFloat_FromDouble((double)loss);
 }
 
-/* ────────────────────────────── train_batch ───────────────────────────────── */
+/* ────────────────────────────── train_batch ─────────────────────────────────
+ * signature: train_batch(net, X[B,nips], Y[B,nops], lr) -> None
+ *
+ * Array discipline:
+ *   - Both X and Y must be float32, C-contiguous, and 2-D matrices.
+ *   - Shapes must agree on the batch dimension.
+ *
+ * Auto-depth remark:
+ *   We pass B to ensure_built as a *proxy* for dataset size. When you feed
+ *   the full dataset in one call, the heuristic will likely select a 2-layer
+ *   architecture (if NNbuild2 is available).                                  */
 static PyObject *py_train_batch(PyObject *self, PyObject *args)
 {
     PyObject *capsule;
@@ -292,7 +371,9 @@ static PyObject *py_train_batch(PyObject *self, PyObject *args)
     FC_Handle *h = (FC_Handle*)PyCapsule_GetPointer(capsule, "frameworkc.nn");
     if (!h) return NULL;
 
-    /* Require float32, 2-D, C-contiguous for both arrays */
+    /* Require float32, 2-D, C-contiguous for both arrays
+     * The checks below are defensive: they avoid silent reinterpretation
+     * (e.g., wrong dtype/strides) that would corrupt learning. */
     if (PyArray_TYPE(x_arr) != NPY_FLOAT32 || PyArray_NDIM(x_arr) != 2 ||
         !PyArray_IS_C_CONTIGUOUS(x_arr) ||
         PyArray_TYPE(t_arr) != NPY_FLOAT32 || PyArray_NDIM(t_arr) != 2 ||
@@ -328,9 +409,40 @@ static PyObject *py_train_batch(PyObject *self, PyObject *args)
     float *restrict Y = (float*)PyArray_DATA(t_arr);
     float lr = (float)lr_double;
 
+    /* Training is pure C and CPU-bound; release the GIL for parallel Python. */
     Py_BEGIN_ALLOW_THREADS
     NNtrain_batch(net, B, X, Y, lr);
     Py_END_ALLOW_THREADS
 
     Py_RETURN_NONE;
 }
+
+#ifdef FWC_OAT
+static PyObject *py_calibrate(PyObject *self, PyObject *args)
+{
+    PyObject *cap = NULL;
+    double latency_ms = -1.0;
+    int repeats = 5;
+    if (!PyArg_ParseTuple(args, "O|di", &cap, &latency_ms, &repeats))
+        return NULL;
+
+    FC_Handle *h = (FC_Handle*)PyCapsule_GetPointer(cap, "frameworkc.nn");
+    if (!h) return NULL;
+
+    if (!ensure_built(h, 0)) {
+        PyErr_SetString(PyExc_RuntimeError, "failed to build network");
+        return NULL;
+    }
+
+    static const int grid[] = {1,4,8,16,32,64,128};
+    NN_oat_calibrate(&h->net, grid, (int)(sizeof(grid)/sizeof(grid[0])),
+                     repeats, (float)latency_ms);
+
+    return Py_BuildValue("{s:f,s:f,s:i,s:i,s:f}",
+                         "alpha_ms",        h->net.oat.alpha_ms,
+                         "beta_ms",         h->net.oat.beta_ms,
+                         "B_star",          h->net.oat.B_star,
+                         "use_gemv_single", h->net.oat.use_gemv_single,
+                         "target_ms",       h->net.oat.target_ms);
+}
+#endif

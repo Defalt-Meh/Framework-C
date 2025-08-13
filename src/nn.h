@@ -9,10 +9,24 @@
 #include <pthread.h>
 #include <unistd.h>     // sysconf
 #include <float.h>
+#include <time.h>
 
 /* Define FWC_CACHE_Z to store hidden-layer pre-activations (z) for exact grads.
    This does not change external APIs; only allocates an extra buffer when enabled. */
 /* #define FWC_CACHE_Z 1 */
+ 
+/* --- OAT: Online Alpha–Beta Tuner state --- */
+#ifdef FWC_OAT
+typedef struct {
+    int   enabled;          /* 1 once calibrated */
+    float alpha_ms;         /* intercept: T(B) ≈ α + β·B */
+    float beta_ms;          /* slope per sample */
+    int   B_star;           /* chosen micro-batch size */
+    int   use_gemv_single;  /* 1 ⇒ use GEMV for single-sample predict, else GEMM */
+    float target_ms;        /* <=0: throughput mode; >0: latency budget */
+} FWC_OAT_State;
+#endif
+
 
 typedef struct
 {
@@ -36,7 +50,9 @@ typedef struct
     int   nhid2;   /* 0 => disabled (1 hidden layer), >0 => enabled */
     float *u;      /* h1→h2 weights: (nhid2 × nhid) row-major */
     float *h2;     /* activations of second hidden layer (nhid2) */
-
+#ifdef FWC_OAT
+    FWC_OAT_State oat;
+#endif
 } NeuralNetwork_Type;
 
 /* Exposed Functions */
@@ -58,5 +74,13 @@ void NNtrain_batch(NeuralNetwork_Type *nn,
                    const float *X,    /* B×nips */
                    const float *Y,    /* B×nops */
                    float lr);
+
+#ifdef FWC_OAT
+void NN_oat_calibrate(NeuralNetwork_Type *nn,
+                      const int *Bgrid, int nB,
+                      int repeats, float target_ms);
+int  NN_oat_get_B(const NeuralNetwork_Type *nn);
+#endif
+
 
 #endif /* NN_H */

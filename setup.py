@@ -3,6 +3,8 @@ from setuptools import setup, Extension
 import subprocess, platform, pathlib, sys, os, shutil
 import numpy as np
 
+mac = sys.platform == "darwin"
+
 def is_clang(cc):
     try:
         out = subprocess.check_output([cc, "--version"], stderr=subprocess.STDOUT, text=True)
@@ -38,22 +40,34 @@ compiler = os.environ.get("CC", "clang" if system=="darwin" else "gcc")
 msvc = (system == "windows") and ("cl" in compiler or "cl.exe" in compiler or os.environ.get("MSVC", ""))
 
 # ---------------- profiles ----------------
-profile   = os.environ.get("FWC_PROFILE", "fast").lower()   # "fast" or "accurate"
-native    = os.environ.get("FWC_NATIVE", "0") == "1"        # add native/arch flags
-use_blas  = os.environ.get("FWC_USE_BLAS")
-relu_on   = os.environ.get("FWC_RELU", "1")                 # <-- default ReLU ON
-use_blas  = has_openblas() or (system=="darwin") if use_blas is None else use_blas
-use_blas  = bool(int(use_blas)) if use_blas in ("0","1") else bool(use_blas)
-relu_on   = bool(int(relu_on)) if relu_on in ("0","1") else bool(relu_on)
+profile = os.environ.get("FWC_PROFILE", "fast").lower()  # "fast" or "accurate"
+native  = os.environ.get("FWC_NATIVE", "0") == "1"       # add native/arch flags
 
+# BLAS + ReLU switches (env overrides allowed)
+use_blas_env = os.environ.get("FWC_USE_BLAS")
+relu_on_env  = os.environ.get("FWC_RELU", "1")           # default ReLU ON
+oat_env      = os.environ.get("FWC_OAT", "1")            # default OAT ON
+
+use_blas = has_openblas() or (system == "darwin") if use_blas_env is None else use_blas_env
+use_blas = bool(int(use_blas)) if use_blas in ("0", "1") else bool(use_blas)
+
+relu_on  = bool(int(relu_on_env)) if relu_on_env in ("0", "1") else bool(relu_on_env)
+oat_on   = bool(int(oat_env)) if oat_env in ("0","1") else bool(oat_env)
+
+# ---------------- compiler flags/macros ----------------
 compile_args = []
-define_macros = [("NPY_NO_DEPRECATED_API", "NPY_1_19_API_VERSION")]
+define_macros = [
+    ("NPY_NO_DEPRECATED_API", "NPY_1_19_API_VERSION"),
+]
 
-# Enable ReLU at compile time for C path
-if relu_on:
-    define_macros += [("FWC_RELU_HID", "1")]
+# OAT (Online Alpha–Beta Tuning) default ON
+if oat_on:
+    define_macros += [("FWC_OAT", "1")]
 else:
-    define_macros += [("FWC_RELU_HID", "0")]
+    define_macros += [("FWC_OAT", "0")]
+
+# ReLU macro (avoid duplicate definitions)
+define_macros += [("FWC_RELU_HID", "1" if relu_on else "0")]
 
 if msvc:
     if profile == "fast":
@@ -84,17 +98,16 @@ library_dirs = []
 extra_link_args = []
 
 if use_blas:
+    define_macros += [("FWC_USE_BLAS", "1")]
     if system == "darwin":
-        define_macros += [("FWC_USE_BLAS", "1"), ("ACCELERATE_NEW_LAPACK", "1")]
+        define_macros += [("ACCELERATE_NEW_LAPACK", "1")]
         extra_link_args += ["-framework", "Accelerate"]
     elif msvc:
-        define_macros += [("FWC_USE_BLAS", "1")]
         ob_dir = os.environ.get("OPENBLAS_DIR")
         if ob_dir:
             library_dirs += [os.path.join(ob_dir, "lib")]
         libraries += ["openblas"]
     else:
-        define_macros += [("FWC_USE_BLAS", "1")]
         try:
             cflags = subprocess.check_output(["pkg-config", "--cflags", "openblas"], text=True).strip().split()
             libs   = subprocess.check_output(["pkg-config", "--libs", "openblas"], text=True).strip().split()
@@ -131,7 +144,7 @@ readme_path = pathlib.Path(__file__).with_name("README.md")
 long_description = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
 
 print(f"[setup] Building on {system}/{machine}", file=sys.stderr)
-print(f"[setup] profile={profile} native={native} blas={use_blas} relu={relu_on}", file=sys.stderr)
+print(f"[setup] profile={profile} native={native} blas={use_blas} relu={relu_on} oat={oat_on}", file=sys.stderr)
 print(f"[setup]  cc={compiler}", file=sys.stderr)
 print(f"[setup]  cflags: {' '.join(compile_args)}", file=sys.stderr)
 print(f"[setup]  macros: {define_macros}", file=sys.stderr)
